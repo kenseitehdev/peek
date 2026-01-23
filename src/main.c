@@ -1,3 +1,7 @@
+// peek.c
+// A tiny ncurses pager with multi-buffer, search, wrap toggle, line numbers, copy-mode,
+// and *man-page highlighting* (plus robust ANSI + overstrike cleanup so man output doesn't break).
+
 #include <ncurses.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +49,13 @@ typedef struct {
     int search_line;
     int search_match_count;
     int current_match;
+    int show_line_numbers;
+    int wrap_enabled;
+
+    // Copy/visual
+    int copy_mode;
+    int copy_start_line;
+    int copy_end_line;
 } ViewerState;
 
 // Color pairs
@@ -58,20 +69,39 @@ typedef struct {
 #define COLOR_TABBAR 8
 #define COLOR_STATUS 9
 #define COLOR_LINENR 10
+#define COLOR_COPY_SELECT 11
 
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
-        "  %s <file1> [file2 ...]\n"
+        "  %s [OPTIONS] <file1> [file2 ...]\n"
         "  %s -                       (read from stdin)\n"
         "  cmd | %s                   (read from stdin)\n"
         "  cmd | %s - file            (stdin + file)\n"
+        "\n"
+        "Options:\n"
+        "  --no-wrap                  Disable line wrapping on startup\n"
         "\n"
         "Man buffers (AUTO-DETECT):\n"
         "  %s \"man grep\" \"man sed\" file1 \"man awk\" file2\n"
         "\n"
         "Optional explicit command mode:\n"
-        "  %s -m \"man grep\" -m \"man sed\" file1\n",
+        "  %s -m \"man grep\" -m \"man sed\" file1\n"
+        "\n"
+        "Keybindings:\n"
+        "  j/k           Scroll down/up\n"
+        "  g/G           Go to top/bottom\n"
+        "  d/u           Half-page down/up\n"
+        "  /             Search\n"
+        "  n/N           Next/previous match\n"
+        "  o             Open file with fzf\n"
+        "  Tab/Shift-Tab Switch buffers\n"
+        "  L             Toggle line numbers\n"
+        "  W             Toggle line wrapping\n"
+        "  v             Enter visual/copy mode\n"
+        "  y             Copy selection (in copy mode)\n"
+        "  Esc           Exit copy mode\n"
+        "  q             Quit\n",
         prog, prog, prog, prog, prog, prog
     );
 }
@@ -85,26 +115,84 @@ static int contains_substr(const char *s, const char *needle) {
     return strstr(s, needle) != NULL;
 }
 
-/*
- * AUTO-DETECT rule:
- * - If the arg begins with "man " -> treat as a man command
- * - Also accept env prefix like "MANWIDTH=200 man grep" (common for wrap control)
- */
 static int is_man_command_arg(const char *arg) {
     if (!arg || !*arg) return 0;
-
     if (starts_with(arg, "man ")) return 1;
 
-    // allow env prefix before man: "MANWIDTH=200 man grep", "FOO=bar MANWIDTH=200 man grep"
-    // heuristic: contains " man " and later "man " token appears.
-    if (contains_substr(arg, " man ") && contains_substr(arg, "man ")) {
-        // A tiny extra guard: make sure the last "man " is not at the very end
+    // crude: if it contains "man " anywhere
+    if (contains_substr(arg, "man ")) {
         const char *p = strstr(arg, "man ");
         return (p && p[4] != '\0');
     }
-
     return 0;
 }
+
+static int cmd_exists(const char *name) {
+    if (!name || !*name) return 0;
+    const char *path = getenv("PATH");
+    if (!path) return 0;
+
+    char buf[4096];
+    strncpy(buf, path, sizeof(buf)-1);
+    buf[sizeof(buf)-1] = '\0';
+
+    char *save = NULL;
+    for (char *dir = strtok_r(buf, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
+        char full[4096];
+        snprintf(full, sizeof(full), "%s/%s", dir, name);
+        if (access(full, X_OK) == 0) return 1;
+    }
+    return 0;
+}
+
+// --- Cleanup helpers ---------------------------------------------------------
+
+// Strip classic man overstrikes (bold/underline via backspace patterns)
+static void strip_overstrikes(char *s) {
+    char *dst = s;
+    for (char *src = s; *src; src++) {
+        if (*src == '\b') {
+            if (dst > s) dst--;
+        } else {
+            *dst++ = *src;
+        }
+    }
+    *dst = '\0';
+}
+
+// Strip ANSI/VT escape sequences (colors, cursor moves, etc.)
+static void strip_ansi(char *s) {
+    char *d = s;
+    for (char *p = s; *p; ) {
+        if ((unsigned char)*p == 0x1B) { // ESC
+            p++;
+            if (*p == '[') { // CSI
+                p++;
+                while (*p && !(*p >= '@' && *p <= '~')) p++;
+                if (*p) p++;
+                continue;
+            } else if (*p == ']') { // OSC ... BEL
+                p++;
+                while (*p && (unsigned char)*p != 0x07) p++;
+                if (*p) p++;
+                continue;
+            } else {
+                if (*p) p++; // other ESC X
+                continue;
+            }
+        }
+        *d++ = *p++;
+    }
+    *d = '\0';
+}
+
+// Trim trailing whitespace (useful for man output)
+static void rtrim(char *s) {
+    int n = (int)strlen(s);
+    while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t')) s[--n] = '\0';
+}
+
+// --- Language detection ------------------------------------------------------
 
 Language detect_language(const char *filepath) {
     const char *ext = strrchr(filepath, '.');
@@ -121,76 +209,52 @@ Language detect_language(const char *filepath) {
     if (strcmp(ext, ".sh") == 0 || strcmp(ext, ".bash") == 0 || strcmp(ext, ".zsh") == 0) return LANG_SHELL;
     if (strcmp(ext, ".md") == 0 || strcmp(ext, ".markdown") == 0) return LANG_MARKDOWN;
 
-    // Check for man pages (no extension, contains certain patterns)
     if (strstr(filepath, "/man/") || strstr(filepath, ".man")) return LANG_MAN;
-
     return LANG_NONE;
 }
 
 int is_c_keyword(const char *word) {
     const char *keywords[] = {
-        "auto", "break", "case", "char", "const", "continue", "default", "do",
-        "double", "else", "enum", "extern", "float", "for", "goto", "if",
-        "int", "long", "register", "return", "short", "signed", "sizeof", "static",
-        "struct", "switch", "typedef", "union", "unsigned", "void", "volatile", "while",
+        "auto","break","case","char","const","continue","default","do",
+        "double","else","enum","extern","float","for","goto","if",
+        "int","long","register","return","short","signed","sizeof","static",
+        "struct","switch","typedef","union","unsigned","void","volatile","while",
         NULL
     };
-
-    for (int i = 0; keywords[i]; i++) {
-        if (strcmp(word, keywords[i]) == 0) return 1;
-    }
+    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
     return 0;
 }
 
 int is_python_keyword(const char *word) {
     const char *keywords[] = {
-        "False", "None", "True", "and", "as", "assert", "async", "await",
-        "break", "class", "continue", "def", "del", "elif", "else", "except",
-        "finally", "for", "from", "global", "if", "import", "in", "is",
-        "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try",
-        "while", "with", "yield",
+        "False","None","True","and","as","assert","async","await",
+        "break","class","continue","def","del","elif","else","except",
+        "finally","for","from","global","if","import","in","is",
+        "lambda","nonlocal","not","or","pass","raise","return","try",
+        "while","with","yield",
         NULL
     };
-
-    for (int i = 0; keywords[i]; i++) {
-        if (strcmp(word, keywords[i]) == 0) return 1;
-    }
+    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
     return 0;
 }
 
 int is_js_keyword(const char *word) {
     const char *keywords[] = {
-        "async", "await", "break", "case", "catch", "class", "const", "continue",
-        "debugger", "default", "delete", "do", "else", "export", "extends", "finally",
-        "for", "function", "if", "import", "in", "instanceof", "let", "new",
-        "return", "super", "switch", "this", "throw", "try", "typeof", "var",
-        "void", "while", "with", "yield",
+        "async","await","break","case","catch","class","const","continue",
+        "debugger","default","delete","do","else","export","extends","finally",
+        "for","function","if","import","in","instanceof","let","new",
+        "return","super","switch","this","throw","try","typeof","var",
+        "void","while","with","yield",
         NULL
     };
-
-    for (int i = 0; keywords[i]; i++) {
-        if (strcmp(word, keywords[i]) == 0) return 1;
-    }
+    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
     return 0;
 }
 
-static void strip_overstrikes(char *s) {
-    // Removes classic man-page backspace overstrike formatting:
-    // "x\b x" (bold) and "_\b x" (underline) both become just "x".
-    char *dst = s;
-    for (char *src = s; *src; src++) {
-        if (*src == '\b') {
-            if (dst > s) dst--; // delete previous character
-        } else {
-            *dst++ = *src;
-        }
-    }
-    *dst = '\0';
-}
+// --- MAN "syntax highlighting" ----------------------------------------------
 
+// "SECTION" headers in rendered man pages are usually all caps words on a line.
 static int is_man_section_header(const char *s) {
-    // Heuristic for man headings: mostly uppercase words, spaces allowed.
-    // Examples: NAME, SYNOPSIS, DESCRIPTION, OPTIONS, EXAMPLES, SEE ALSO
     int letters = 0;
     for (; *s; s++) {
         if (*s == ' ') continue;
@@ -201,15 +265,76 @@ static int is_man_section_header(const char *s) {
     return letters >= 3;
 }
 
+// Helper: highlight a token region [i, j)
+static void draw_tok(int y, int x, const char *s, int i, int j, int max_x, int pair, int bold) {
+    if (x >= max_x) return;
+    if (bold) attron(COLOR_PAIR(pair) | A_BOLD);
+    else attron(COLOR_PAIR(pair));
+
+    for (int k = i; k < j && x < max_x; k++) {
+        mvaddch(y, x++, s[k]);
+    }
+
+    if (bold) attroff(COLOR_PAIR(pair) | A_BOLD);
+    else attroff(COLOR_PAIR(pair));
+}
+
+// --- Wrapping ---------------------------------------------------------------
+
+typedef struct {
+    int count;
+    char **segments;
+} WrappedLine;
+
+WrappedLine wrap_line(const char *line, int width) {
+    WrappedLine result = {0, NULL};
+    if (!line || width <= 0) return result;
+
+    int len = (int)strlen(line);
+    if (len == 0) {
+        result.segments = malloc(sizeof(char*));
+        result.segments[0] = strdup("");
+        result.count = 1;
+        return result;
+    }
+
+    int max_segments = (len / width) + 2;
+    result.segments = malloc(max_segments * sizeof(char*));
+
+    int pos = 0;
+    while (pos < len) {
+        int remaining = len - pos;
+        int take = (remaining > width) ? width : remaining;
+
+        char *seg = malloc(take + 1);
+        strncpy(seg, line + pos, take);
+        seg[take] = '\0';
+
+        result.segments[result.count++] = seg;
+        pos += take;
+    }
+    return result;
+}
+
+void free_wrapped_line(WrappedLine *wl) {
+    if (!wl || !wl->segments) return;
+    for (int i = 0; i < wl->count; i++) free(wl->segments[i]);
+    free(wl->segments);
+    wl->segments = NULL;
+    wl->count = 0;
+}
+
+// --- Highlighter ------------------------------------------------------------
+
 void highlight_line(const char *line, Language lang, int y, int start_x, int line_width) {
     if (!line) return;
 
-    // Man page highlighting (lightweight but helpful)
+    // MAN highlighting (rendered man text)
     if (lang == LANG_MAN) {
         const char *p = line;
         while (*p == ' ') p++;
 
-        // Section heading
+        // Section headers (NAME, SYNOPSIS, DESCRIPTION, OPTIONS, etc.)
         if (is_man_section_header(p)) {
             attron(COLOR_PAIR(COLOR_KEYWORD) | A_BOLD);
             mvaddnstr(y, start_x, line, line_width - start_x);
@@ -217,51 +342,76 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             return;
         }
 
-        // Highlight flags: -x, --long
-        int len2 = (int)strlen(line);
-        int i2 = 0;
-        int col2 = start_x;
+        int len = (int)strlen(line);
+        int i = 0;
+        int x = start_x;
 
-        while (i2 < len2 && col2 < line_width) {
-            if (line[i2] == ' ') {
-                mvaddch(y, col2++, line[i2++]);
+        while (i < len && x < line_width) {
+            unsigned char ch = (unsigned char)line[i];
+
+            // whitespace
+            if (isspace(ch)) {
+                mvaddch(y, x++, line[i++]);
                 continue;
             }
 
-            if (line[i2] == '-') {
-                int j = i2;
-                while (j < len2 && !isspace((unsigned char)line[j])) j++;
+            // options like -a, -rf, --color=auto
+            if (line[i] == '-') {
+                int j = i;
+                while (j < len && !isspace((unsigned char)line[j])) j++;
 
-                // Reuse NUMBER color for flags
-                attron(COLOR_PAIR(COLOR_NUMBER) | A_BOLD);
-                while (i2 < j && col2 < line_width) {
-                    mvaddch(y, col2++, line[i2++]);
+                // highlight option flags
+                draw_tok(y, x, line, i, j, line_width, COLOR_NUMBER, 1);
+                x += (j - i);
+                i = j;
+                continue;
+            }
+
+            // function-ish tokens like printf(3), open(2), etc.
+            if (isalpha((unsigned char)line[i]) || line[i] == '_') {
+                int j = i;
+                while (j < len && (isalnum((unsigned char)line[j]) || line[j] == '_' || line[j] == '-')) j++;
+
+                // check for "(digit)" right after
+                int k = j;
+                if (k + 2 < len && line[k] == '(' && isdigit((unsigned char)line[k+1])) {
+                    int kk = k+2;
+                    while (kk < len && isdigit((unsigned char)line[kk])) kk++;
+                    if (kk < len && line[kk] == ')') {
+                        // highlight name as function/type and the section part too
+                        draw_tok(y, x, line, i, j, line_width, COLOR_FUNCTION, 1);
+                        x += (j - i);
+                        draw_tok(y, x, line, k, kk+1, line_width, COLOR_TYPE, 0);
+                        x += (kk+1 - k);
+                        i = kk + 1;
+                        continue;
+                    }
                 }
-                attroff(COLOR_PAIR(COLOR_NUMBER) | A_BOLD);
+
+                // default: normal word
+                while (i < j && x < line_width) mvaddch(y, x++, line[i++]);
                 continue;
             }
 
-            mvaddch(y, col2++, line[i2++]);
+            // everything else
+            mvaddch(y, x++, line[i++]);
         }
         return;
     }
 
+    // --- Code-ish highlighting for other languages --------------------------
     int len = (int)strlen(line);
     int i = 0;
     int col = start_x;
 
-    // Simple syntax highlighting
     while (i < len && col < line_width) {
         char ch = line[i];
 
-        // Comments
         if ((lang == LANG_C || lang == LANG_CPP || lang == LANG_JAVA || lang == LANG_JS || lang == LANG_TS || lang == LANG_CSS) &&
             i + 1 < len && line[i] == '/' && line[i+1] == '/') {
             attron(COLOR_PAIR(COLOR_COMMENT));
             int j = i;
-            while (j < len && col < line_width) {
-                mvaddch(y, col++, line[j++]);
-            }
+            while (j < len && col < line_width) mvaddch(y, col++, line[j++]);
             attroff(COLOR_PAIR(COLOR_COMMENT));
             break;
         }
@@ -269,14 +419,11 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
         if ((lang == LANG_PYTHON || lang == LANG_SHELL) && ch == '#') {
             attron(COLOR_PAIR(COLOR_COMMENT));
             int j = i;
-            while (j < len && col < line_width) {
-                mvaddch(y, col++, line[j++]);
-            }
+            while (j < len && col < line_width) mvaddch(y, col++, line[j++]);
             attroff(COLOR_PAIR(COLOR_COMMENT));
             break;
         }
 
-        // Strings
         if (ch == '"' || ch == '\'') {
             char quote = ch;
             attron(COLOR_PAIR(COLOR_STRING));
@@ -285,17 +432,13 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             while (i < len && col < line_width) {
                 ch = line[i];
                 mvaddch(y, col++, ch);
-                if (ch == quote && (i == 0 || line[i-1] != '\\')) {
-                    i++;
-                    break;
-                }
+                if (ch == quote && (i == 0 || line[i-1] != '\\')) { i++; break; }
                 i++;
             }
             attroff(COLOR_PAIR(COLOR_STRING));
             continue;
         }
 
-        // Numbers
         if (isdigit((unsigned char)ch)) {
             attron(COLOR_PAIR(COLOR_NUMBER));
             while (i < len && col < line_width &&
@@ -306,7 +449,6 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             continue;
         }
 
-        // Keywords
         if (isalpha((unsigned char)ch) || ch == '_') {
             char word[128] = {0};
             int w = 0;
@@ -320,25 +462,20 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             else if (lang == LANG_PYTHON) is_keyword = is_python_keyword(word);
             else if (lang == LANG_JS || lang == LANG_TS) is_keyword = is_js_keyword(word);
 
-            if (is_keyword) {
-                attron(COLOR_PAIR(COLOR_KEYWORD) | A_BOLD);
-            }
+            if (is_keyword) attron(COLOR_PAIR(COLOR_KEYWORD) | A_BOLD);
 
-            for (int k = 0; k < w && col < line_width; k++) {
-                mvaddch(y, col++, word[k]);
-            }
+            for (int k = 0; k < w && col < line_width; k++) mvaddch(y, col++, word[k]);
 
-            if (is_keyword) {
-                attroff(COLOR_PAIR(COLOR_KEYWORD) | A_BOLD);
-            }
+            if (is_keyword) attroff(COLOR_PAIR(COLOR_KEYWORD) | A_BOLD);
             continue;
         }
 
-        // Default
         mvaddch(y, col++, ch);
         i++;
     }
 }
+
+// --- Loaders ----------------------------------------------------------------
 
 int load_file(Buffer *buf, const char *filepath) {
     FILE *f = fopen(filepath, "r");
@@ -354,8 +491,10 @@ int load_file(Buffer *buf, const char *filepath) {
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), f) && buf->line_count < MAX_LINES) {
         line[strcspn(line, "\n")] = 0;
-        buf->lines[buf->line_count] = strdup(line);
-        buf->line_count++;
+        strip_overstrikes(line);
+        strip_ansi(line);
+        rtrim(line);
+        buf->lines[buf->line_count++] = strdup(line);
     }
 
     fclose(f);
@@ -373,14 +512,13 @@ int load_stdin(Buffer *buf) {
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), stdin) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) {
-            line[--len] = '\0';
-        }
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
 
         strip_overstrikes(line);
+        strip_ansi(line);
+        rtrim(line);
 
-        buf->lines[buf->line_count] = strdup(line);
-        buf->line_count++;
+        buf->lines[buf->line_count++] = strdup(line);
     }
 
     return buf->line_count > 0 ? 0 : -1;
@@ -401,20 +539,32 @@ static int load_command(Buffer *buf, const char *label, const char *cmd, Languag
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
-        }
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
 
         strip_overstrikes(line);
+        strip_ansi(line);
+        rtrim(line);
 
-        buf->lines[buf->line_count] = strdup(line);
-        buf->line_count++;
+        buf->lines[buf->line_count++] = strdup(line);
     }
 
     int rc = pclose(p);
     (void)rc;
 
     return (buf->line_count > 0) ? 0 : -1;
+}
+
+// Wrap a detected "man foo" command so output is plain text (no ANSI pager junk).
+static void build_man_cmd_plain(char *out, size_t outsz, const char *man_cmd) {
+    // Force MANPAGER=cat, and if 'col' exists, pass through col -bx (optional).
+    // We still strip ANSI regardless, but this reduces environment-dependent surprises.
+    int have_col = cmd_exists("col");
+
+    if (have_col) {
+        snprintf(out, outsz, "MANPAGER=cat %s 2>/dev/null | col -bx", man_cmd);
+    } else {
+        snprintf(out, outsz, "MANPAGER=cat %s 2>/dev/null", man_cmd);
+    }
 }
 
 void free_buffer(Buffer *buf) {
@@ -426,39 +576,30 @@ void free_buffer(Buffer *buf) {
     buf->is_active = 0;
 }
 
-// Search functions
+// --- Search -----------------------------------------------------------------
+
 int search_buffer(ViewerState *state, const char *term, int start_line, int direction) {
     Buffer *buf = &state->buffers[state->current_buffer];
-
     if (term[0] == '\0') return -1;
 
     int line = start_line;
-
     for (int i = 0; i < buf->line_count; i++) {
         if (line < 0) line = buf->line_count - 1;
         if (line >= buf->line_count) line = 0;
 
-        if (strstr(buf->lines[line], term)) {
-            return line;
-        }
-
+        if (strstr(buf->lines[line], term)) return line;
         line += direction;
     }
-
     return -1;
 }
 
 void find_all_matches(ViewerState *state) {
     Buffer *buf = &state->buffers[state->current_buffer];
     state->search_match_count = 0;
-
     if (state->search_term[0] == '\0') return;
 
-    for (int i = 0; i < buf->line_count; i++) {
-        if (strstr(buf->lines[i], state->search_term)) {
-            state->search_match_count++;
-        }
-    }
+    for (int i = 0; i < buf->line_count; i++)
+        if (strstr(buf->lines[i], state->search_term)) state->search_match_count++;
 }
 
 void prompt_search(ViewerState *state) {
@@ -495,11 +636,9 @@ void prompt_search(ViewerState *state) {
             state->buffers[state->current_buffer].scroll_offset = match;
 
             int count = 0;
-            for (int i = 0; i < match; i++) {
-                if (strstr(state->buffers[state->current_buffer].lines[i], state->search_term)) {
-                    count++;
-                }
-            }
+            for (int i = 0; i < match; i++)
+                if (strstr(state->buffers[state->current_buffer].lines[i], state->search_term)) count++;
+
             state->current_match = count;
         }
     }
@@ -507,41 +646,48 @@ void prompt_search(ViewerState *state) {
 
 void next_match(ViewerState *state) {
     if (state->search_term[0] == '\0') return;
-
     Buffer *buf = &state->buffers[state->current_buffer];
     int match = search_buffer(state, state->search_term, buf->scroll_offset + 1, 1);
-
     if (match >= 0) {
         buf->scroll_offset = match;
-
         int count = 0;
-        for (int i = 0; i < match; i++) {
-            if (strstr(buf->lines[i], state->search_term)) {
-                count++;
-            }
-        }
+        for (int i = 0; i < match; i++) if (strstr(buf->lines[i], state->search_term)) count++;
         state->current_match = count;
     }
 }
 
 void prev_match(ViewerState *state) {
     if (state->search_term[0] == '\0') return;
-
     Buffer *buf = &state->buffers[state->current_buffer];
     int match = search_buffer(state, state->search_term, buf->scroll_offset - 1, -1);
-
     if (match >= 0) {
         buf->scroll_offset = match;
-
         int count = 0;
-        for (int i = 0; i < match; i++) {
-            if (strstr(buf->lines[i], state->search_term)) {
-                count++;
-            }
-        }
+        for (int i = 0; i < match; i++) if (strstr(buf->lines[i], state->search_term)) count++;
         state->current_match = count;
     }
 }
+
+// --- Copy -------------------------------------------------------------------
+
+void copy_selection_to_clipboard(ViewerState *state) {
+    Buffer *buf = &state->buffers[state->current_buffer];
+
+    int start = state->copy_start_line;
+    int end = state->copy_end_line;
+    if (start > end) { int t = start; start = end; end = t; }
+
+    // Best-effort clipboard: xclip OR pbcopy. If neither exists, we silently do nothing.
+    FILE *pipe = popen("xclip -selection clipboard 2>/dev/null || pbcopy 2>/dev/null", "w");
+    if (!pipe) return;
+
+    for (int i = start; i <= end && i < buf->line_count; i++)
+        fprintf(pipe, "%s\n", buf->lines[i]);
+
+    pclose(pipe);
+}
+
+// --- UI ---------------------------------------------------------------------
 
 void draw_tabbar(ViewerState *state) {
     int max_x = getmaxx(stdscr);
@@ -557,18 +703,15 @@ void draw_tabbar(ViewerState *state) {
         if (!name) name = state->buffers[i].filepath;
         else name++;
 
-        if (i == state->current_buffer) {
-            attron(A_REVERSE | A_BOLD);
-        }
+        if (i == state->current_buffer) attron(A_REVERSE | A_BOLD);
 
         mvprintw(0, x, " %s ", name);
         x += (int)strlen(name) + 2;
 
-        if (i == state->current_buffer) {
-            attroff(A_REVERSE | A_BOLD);
-        }
+        if (i == state->current_buffer) attroff(A_REVERSE | A_BOLD);
 
-        mvaddch(0, x++, '|');
+        if (x < max_x - 1) mvaddch(0, x++, '|');
+        if (x >= max_x - 12) break;
     }
 
     mvprintw(0, max_x - 10, " [%d/%d] ", state->current_buffer + 1, state->buffer_count);
@@ -589,11 +732,14 @@ void draw_status_bar(ViewerState *state) {
     else name++;
 
     int percent = buf->line_count > 0 ? (buf->scroll_offset * 100) / buf->line_count : 0;
+    const char *mode = state->copy_mode ? "VISUAL" : "NORMAL";
 
     char left[512];
-    snprintf(left, sizeof(left), " NORMAL | %s | %d%% | %d/%d lines",
-             name, percent,
-             buf->scroll_offset + 1, buf->line_count);
+    snprintf(left, sizeof(left), " %s | %s | %d%% | %d/%d lines | L:%s W:%s",
+             mode, name, percent,
+             buf->scroll_offset + 1, buf->line_count,
+             state->show_line_numbers ? "ON" : "OFF",
+             state->wrap_enabled ? "ON" : "OFF");
 
     mvprintw(max_y - 2, 1, "%s", left);
 
@@ -615,42 +761,99 @@ void draw_help_line() {
 
     attron(COLOR_PAIR(COLOR_NORMAL));
     mvhline(max_y - 1, 0, ' ', max_x);
-    mvprintw(max_y - 1, 1, "j/k:scroll  g/G:top/bottom  /:search  n/N:next/prev  o:fzf-open  Tab:next-buf  q:quit");
+    mvprintw(max_y - 1, 1,
+             "j/k:scroll  g/G:top/bot  /:search  n/N:next/prev  L:line#  W:wrap  v:copy  y:yank  o:fzf  Tab:buf  q:quit");
     attroff(COLOR_PAIR(COLOR_NORMAL));
 }
 
-void draw_buffer(Buffer *buf) {
+void draw_buffer(ViewerState *state) {
+    Buffer *buf = &state->buffers[state->current_buffer];
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
 
     int content_start_y = 1;
     int content_height = max_y - 3;
-    int line_nr_width = 6;
+    int line_nr_width = state->show_line_numbers ? 6 : 0;
 
-    for (int i = 0; i < content_height; i++) {
-        int line_idx = buf->scroll_offset + i;
-        int y = content_start_y + i;
+    if (state->wrap_enabled) {
+        int y = content_start_y;
+        int logical_line = buf->scroll_offset;
 
-        mvhline(y, 0, ' ', max_x);
+        while (y < content_start_y + content_height && logical_line < buf->line_count) {
+            mvhline(y, 0, ' ', max_x);
 
-        if (line_idx >= buf->line_count) continue;
+            int text_width = max_x - line_nr_width - 1;
+            if (text_width <= 0) text_width = max_x;
 
-        attron(COLOR_PAIR(COLOR_LINENR));
-        mvprintw(y, 1, "%4d ", line_idx + 1);
-        attroff(COLOR_PAIR(COLOR_LINENR));
+            WrappedLine wl = wrap_line(buf->lines[logical_line], text_width);
 
-        highlight_line(buf->lines[line_idx], buf->lang, y, line_nr_width + 1, max_x);
+            for (int seg = 0; seg < wl.count && y < content_start_y + content_height; seg++) {
+                if (state->show_line_numbers && seg == 0) {
+                    attron(COLOR_PAIR(COLOR_LINENR));
+                    mvprintw(y, 1, "%4d ", logical_line + 1);
+                    attroff(COLOR_PAIR(COLOR_LINENR));
+                } else if (state->show_line_numbers) {
+                    mvprintw(y, 1, "     ");
+                }
+
+                int a = state->copy_start_line;
+                int b = state->copy_end_line;
+                int lo = (a < b) ? a : b;
+                int hi = (a > b) ? a : b;
+
+                int in_selection = state->copy_mode && logical_line >= lo && logical_line <= hi;
+
+                if (in_selection) attron(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
+                highlight_line(wl.segments[seg], buf->lang, y, line_nr_width + 1, max_x);
+                if (in_selection) attroff(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
+
+                y++;
+            }
+
+            free_wrapped_line(&wl);
+            logical_line++;
+        }
+
+        while (y < content_start_y + content_height) mvhline(y++, 0, ' ', max_x);
+
+    } else {
+        for (int i = 0; i < content_height; i++) {
+            int line_idx = buf->scroll_offset + i;
+            int y = content_start_y + i;
+
+            mvhline(y, 0, ' ', max_x);
+            if (line_idx >= buf->line_count) continue;
+
+            if (state->show_line_numbers) {
+                attron(COLOR_PAIR(COLOR_LINENR));
+                mvprintw(y, 1, "%4d ", line_idx + 1);
+                attroff(COLOR_PAIR(COLOR_LINENR));
+            }
+
+            int a = state->copy_start_line;
+            int b = state->copy_end_line;
+            int lo = (a < b) ? a : b;
+            int hi = (a > b) ? a : b;
+
+            int in_selection = state->copy_mode && line_idx >= lo && line_idx <= hi;
+
+            if (in_selection) attron(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
+            highlight_line(buf->lines[line_idx], buf->lang, y, line_nr_width + 1, max_x);
+            if (in_selection) attroff(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
+        }
     }
 }
 
 void draw_ui(ViewerState *state) {
     clear();
     draw_tabbar(state);
-    draw_buffer(&state->buffers[state->current_buffer]);
+    draw_buffer(state);
     draw_status_bar(state);
     draw_help_line();
     refresh();
 }
+
+// --- Input ------------------------------------------------------------------
 
 void handle_input(ViewerState *state, int *running) {
     int ch = getch();
@@ -662,103 +865,140 @@ void handle_input(ViewerState *state, int *running) {
     switch (ch) {
         case 'q':
         case 'Q':
-            *running = 0;
+            if (!state->copy_mode) *running = 0;
+            break;
+
+        case 27: // ESC
+            if (state->copy_mode) state->copy_mode = 0;
+            break;
+
+        case 'v':
+            if (!state->copy_mode) {
+                state->copy_mode = 1;
+                state->copy_start_line = buf->scroll_offset;
+                state->copy_end_line = buf->scroll_offset;
+            }
+            break;
+
+        case 'y':
+            if (state->copy_mode) {
+                copy_selection_to_clipboard(state);
+                state->copy_mode = 0;
+            }
+            break;
+
+        case 'L':
+            state->show_line_numbers = !state->show_line_numbers;
+            break;
+
+        case 'W':
+            state->wrap_enabled = !state->wrap_enabled;
             break;
 
         case '/':
-            prompt_search(state);
+            if (!state->copy_mode) prompt_search(state);
             break;
 
         case 'n':
-            next_match(state);
+            if (!state->copy_mode) next_match(state);
             break;
 
         case 'N':
-            prev_match(state);
+            if (!state->copy_mode) prev_match(state);
             break;
 
         case 'o':
-        case 'O': {
-            endwin();
+        case 'O':
+            if (!state->copy_mode) {
+                endwin();
 
-            char cwd[1024];
-            if (!getcwd(cwd, sizeof(cwd))) break;
+                char cwd[1024];
+                if (!getcwd(cwd, sizeof(cwd))) break;
 
-            char cmd[2048];
-            snprintf(cmd, sizeof(cmd),
-                     "find '%s' -type f 2>/dev/null | "
-                     "fzf --prompt='Open File> ' --height=40%% --reverse",
-                     cwd);
+                char cmd[2048];
+                snprintf(cmd, sizeof(cmd),
+                         "find '%s' -type f 2>/dev/null | "
+                         "fzf --prompt='Open File> ' --height=40%% --reverse",
+                         cwd);
 
-            FILE *p = popen(cmd, "r");
-            if (p) {
-                char filepath[1024] = {0};
-                if (fgets(filepath, sizeof(filepath), p)) {
-                    filepath[strcspn(filepath, "\r\n")] = '\0';
-
-                    if (filepath[0] != '\0' && state->buffer_count < MAX_BUFFERS) {
-                        if (load_file(&state->buffers[state->buffer_count], filepath) == 0) {
-                            state->current_buffer = state->buffer_count;
-                            state->buffer_count++;
+                FILE *p = popen(cmd, "r");
+                if (p) {
+                    char filepath[1024] = {0};
+                    if (fgets(filepath, sizeof(filepath), p)) {
+                        filepath[strcspn(filepath, "\r\n")] = '\0';
+                        if (filepath[0] != '\0' && state->buffer_count < MAX_BUFFERS) {
+                            if (load_file(&state->buffers[state->buffer_count], filepath) == 0) {
+                                state->current_buffer = state->buffer_count;
+                                state->buffer_count++;
+                            }
                         }
                     }
+                    pclose(p);
                 }
-                pclose(p);
-            }
 
-            refresh();
-            clear();
+                refresh();
+                clear();
+            }
             break;
-        }
 
         case 'j':
         case KEY_DOWN:
-            if (buf->scroll_offset < buf->line_count - 1) buf->scroll_offset++;
+            if (buf->scroll_offset < buf->line_count - 1) {
+                buf->scroll_offset++;
+                if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
+            }
             break;
 
         case 'k':
         case KEY_UP:
-            if (buf->scroll_offset > 0) buf->scroll_offset--;
+            if (buf->scroll_offset > 0) {
+                buf->scroll_offset--;
+                if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
+            }
             break;
 
         case 'g':
             buf->scroll_offset = 0;
+            if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
             break;
 
         case 'G':
             buf->scroll_offset = buf->line_count - visible_lines;
             if (buf->scroll_offset < 0) buf->scroll_offset = 0;
+            if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
             break;
 
         case 'd':
         case 4: // Ctrl+D
             buf->scroll_offset += visible_lines / 2;
-            if (buf->scroll_offset > buf->line_count - visible_lines) {
+            if (buf->scroll_offset > buf->line_count - visible_lines)
                 buf->scroll_offset = buf->line_count - visible_lines;
-            }
             if (buf->scroll_offset < 0) buf->scroll_offset = 0;
+            if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
             break;
 
         case 'u':
         case 21: // Ctrl+U
             buf->scroll_offset -= visible_lines / 2;
             if (buf->scroll_offset < 0) buf->scroll_offset = 0;
+            if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
             break;
 
         case '\t':
-            if (state->buffer_count > 1) {
+            if (!state->copy_mode && state->buffer_count > 1)
                 state->current_buffer = (state->current_buffer + 1) % state->buffer_count;
-            }
             break;
 
         case KEY_BTAB:
-            if (state->buffer_count > 1) {
+            if (!state->copy_mode && state->buffer_count > 1) {
                 state->current_buffer--;
                 if (state->current_buffer < 0) state->current_buffer = state->buffer_count - 1;
             }
             break;
     }
 }
+
+// --- main -------------------------------------------------------------------
 
 int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
@@ -769,17 +1009,37 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Default settings
+    state->show_line_numbers = 1;
+    state->wrap_enabled = 1;
+    state->copy_mode = 0;
+
     int stdin_is_pipe = !isatty(STDIN_FILENO);
     int loaded_anything = 0;
+    int arg_start = 1;
 
-    // If no args: only valid when stdin is piped
-    if (argc < 2) {
+    // Parse flags
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-wrap") == 0) {
+            state->wrap_enabled = 0;
+            arg_start = i + 1;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]);
+            free(state);
+            return 0;
+        } else {
+            break;
+        }
+    }
+
+    int effective_argc = argc - (arg_start - 1);
+
+    if (effective_argc < 2) {
         if (!stdin_is_pipe) {
             usage(argv[0]);
             free(state);
             return 1;
         }
-
         if (load_stdin(&state->buffers[state->buffer_count]) == 0) {
             state->buffer_count++;
             loaded_anything = 1;
@@ -789,14 +1049,8 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     } else {
-        // Args provided.
-        // Supported:
-        // - "-" -> stdin buffer
-        // - "-m <cmd>" -> explicit command buffer (kept, but now optional)
-        // - AUTO: args that look like "man ..." -> command buffer as LANG_MAN
-        // - otherwise: file
-        for (int i = 1; i < argc && state->buffer_count < MAX_BUFFERS; i++) {
-            // Explicit command buffer mode
+        for (int i = arg_start; i < argc && state->buffer_count < MAX_BUFFERS; i++) {
+
             if (strcmp(argv[i], "-m") == 0) {
                 if (i + 1 >= argc) {
                     fprintf(stderr, "peek: -m requires a command string\n");
@@ -808,16 +1062,27 @@ int main(int argc, char *argv[]) {
                 char label[1024];
                 snprintf(label, sizeof(label), "[%s]", cmd);
 
-                if (load_command(&state->buffers[state->buffer_count], label, cmd, LANG_MAN) == 0) {
-                    state->buffer_count++;
-                    loaded_anything = 1;
+                // If cmd is a man command, force plain output
+                if (is_man_command_arg(cmd)) {
+                    char cmd2[2048];
+                    build_man_cmd_plain(cmd2, sizeof(cmd2), cmd);
+                    if (load_command(&state->buffers[state->buffer_count], label, cmd2, LANG_MAN) == 0) {
+                        state->buffer_count++;
+                        loaded_anything = 1;
+                    } else {
+                        fprintf(stderr, "peek: failed to run command: %s\n", cmd);
+                    }
                 } else {
-                    fprintf(stderr, "peek: failed to run command: %s\n", cmd);
+                    if (load_command(&state->buffers[state->buffer_count], label, cmd, LANG_NONE) == 0) {
+                        state->buffer_count++;
+                        loaded_anything = 1;
+                    } else {
+                        fprintf(stderr, "peek: failed to run command: %s\n", cmd);
+                    }
                 }
                 continue;
             }
 
-            // stdin buffer
             if (strcmp(argv[i], "-") == 0) {
                 if (load_stdin(&state->buffers[state->buffer_count]) == 0) {
                     state->buffer_count++;
@@ -828,13 +1093,15 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            // AUTO-DETECT man commands (no -m required)
             if (is_man_command_arg(argv[i])) {
                 const char *cmd = argv[i];
                 char label[1024];
                 snprintf(label, sizeof(label), "[%s]", cmd);
 
-                if (load_command(&state->buffers[state->buffer_count], label, cmd, LANG_MAN) == 0) {
+                char cmd2[2048];
+                build_man_cmd_plain(cmd2, sizeof(cmd2), cmd);
+
+                if (load_command(&state->buffers[state->buffer_count], label, cmd2, LANG_MAN) == 0) {
                     state->buffer_count++;
                     loaded_anything = 1;
                 } else {
@@ -843,7 +1110,6 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            // Otherwise: normal file
             if (load_file(&state->buffers[state->buffer_count], argv[i]) == 0) {
                 state->buffer_count++;
                 loaded_anything = 1;
@@ -859,8 +1125,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // --- Initialize ncurses ---
-    // If stdin is a pipe, ncurses cannot use stdin for keyboard input.
     FILE *tty_in = NULL;
     SCREEN *screen = NULL;
 
@@ -872,7 +1136,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        screen = newterm(NULL, stdout, tty_in); // output: stdout, input: /dev/tty
+        screen = newterm(NULL, stdout, tty_in);
         if (!screen) {
             fprintf(stderr, "newterm() failed\n");
             fclose(tty_in);
@@ -903,6 +1167,7 @@ int main(int argc, char *argv[]) {
         init_pair(COLOR_TABBAR,  COLOR_BLACK,  COLOR_CYAN);
         init_pair(COLOR_STATUS,  COLOR_BLACK,  COLOR_CYAN);
         init_pair(COLOR_LINENR,  COLOR_YELLOW, -1);
+        init_pair(COLOR_COPY_SELECT, COLOR_WHITE, COLOR_BLUE);
     }
 
     int running = 1;
@@ -911,9 +1176,7 @@ int main(int argc, char *argv[]) {
         handle_input(state, &running);
     }
 
-    for (int i = 0; i < state->buffer_count; i++) {
-        free_buffer(&state->buffers[i]);
-    }
+    for (int i = 0; i < state->buffer_count; i++) free_buffer(&state->buffers[i]);
 
     endwin();
     if (screen) delscreen(screen);
