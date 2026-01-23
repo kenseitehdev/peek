@@ -762,7 +762,7 @@ void draw_help_line() {
     attron(COLOR_PAIR(COLOR_NORMAL));
     mvhline(max_y - 1, 0, ' ', max_x);
     mvprintw(max_y - 1, 1,
-             "j/k:scroll  g/G:top/bot  /:search  n/N:next/prev  L:line#  W:wrap  v:copy  y:yank  o:fzf  Tab:buf  q:quit");
+             "j/k:scroll  g/G:top/bot  /:search  n/N:next/prev  l:line#  w:wrap  v:copy  y:yank  o:fzf  Tab:buf  q:quit");
     attroff(COLOR_PAIR(COLOR_NORMAL));
 }
 
@@ -887,10 +887,12 @@ void handle_input(ViewerState *state, int *running) {
             }
             break;
 
+        case 'l':
         case 'L':
             state->show_line_numbers = !state->show_line_numbers;
             break;
 
+        case 'w':    
         case 'W':
             state->wrap_enabled = !state->wrap_enabled;
             break;
