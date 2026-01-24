@@ -1,7 +1,7 @@
 // peek.c
 // A tiny ncurses pager with multi-buffer, search, wrap toggle, line numbers, copy-mode,
 // and *man-page highlighting* (plus robust ANSI + overstrike cleanup so man output doesn't break).
-
+#define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <stdlib.h>
 #include <string.h>
