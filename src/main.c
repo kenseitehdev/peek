@@ -13,7 +13,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#define MAX_BUFFERS 16
+#define MAX_BUFFERS 50
 #define MAX_LINES 10000
 #define MAX_LINE_LEN 2048
 
