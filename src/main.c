@@ -96,7 +96,7 @@ static void usage(const char *prog) {
         "  d/u           Half-page down/up\n"
         "  /             Search\n"
         "  n/N           Next/previous match\n"
-        "  r             Make HTTP request\n"
+        "  r             Make HTTP request (opens popup)\n"
         "  R             Reload current HTTP buffer\n"
         "  x             Close current buffer\n"
         "  o             Open file with fzf\n"
@@ -105,7 +105,7 @@ static void usage(const char *prog) {
         "  W             Toggle line wrapping\n"
         "  v             Enter visual/copy mode\n"
         "  y             Copy selection (in copy mode)\n"
-        "  Esc           Exit copy mode\n"
+        "  Esc           Exit copy mode / Cancel popup\n"
         "  q             Quit\n",
         prog, prog, prog, prog, prog, prog
     );
@@ -606,11 +606,14 @@ int load_http_response(Buffer *buf, const char *request_input) {
     strncpy(buf->http_request, request_input, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
     
-    // Build the command: xh with jq formatting, fallback to plain xh
+    // Build the command: Use xh with pretty printing for both headers and body
+    // --print=hb shows headers and body, --pretty=format forces formatting
+    // Then try to format JSON with jq if present, otherwise show as-is
     char cmd[2048];
     snprintf(cmd, sizeof(cmd), 
-             "xh -v %s 2>&1 | jq . 2>/dev/null || xh %s 2>&1", 
-             request_input, request_input);
+             "OUTPUT=$(xh --print=hb --pretty=format %s 2>&1); "
+             "echo \"$OUTPUT\" | jq -C . 2>/dev/null || echo \"$OUTPUT\"",
+             request_input);
     
     // Create a label for the buffer
     char label[256];
@@ -640,28 +643,180 @@ int load_http_response(Buffer *buf, const char *request_input) {
     return (buf->line_count > 0) ? 0 : -1;
 }
 
+// Helper function for HTTP request popup to redraw visible lines
+static void http_popup_redraw_lines(WINDOW *popup, char lines[][256], int max_lines,
+                                     int current_line, int pos, int scroll_offset,
+                                     int visible_lines, int popup_width) {
+    for (int i = 0; i < visible_lines; i++) {
+        int line_idx = scroll_offset + i;
+        int y = 9 + i;
+        
+        // Clear line
+        mvwhline(popup, y, 2, ' ', popup_width - 3);
+        
+        if (line_idx < max_lines) {
+            mvwprintw(popup, y, 2, ">");
+            if (lines[line_idx][0] != '\0') {
+                mvwprintw(popup, y, 4, "%s", lines[line_idx]);
+            }
+        }
+    }
+    
+    // Show cursor on current line if visible
+    int cursor_y = 9 + (current_line - scroll_offset);
+    if (cursor_y >= 9 && cursor_y < 9 + visible_lines) {
+        wmove(popup, cursor_y, 4 + pos);
+    }
+    
+    wrefresh(popup);
+}
+
 void prompt_http_request(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
 
-    attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-    mvhline(max_y - 2, 0, ' ', max_x);
-    mvprintw(max_y - 2, 1, "HTTP Request (e.g. GET api.example.com/path): ");
-    attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+    // Create popup window - bigger to accommodate scrolling
+    int popup_height = 20;
+    int popup_width = 70;
+    int start_y = (max_y - popup_height) / 2;
+    int start_x = (max_x - popup_width) / 2;
 
-    move(max_y - 2, 49);
+    WINDOW *popup = newwin(popup_height, popup_width, start_y, start_x);
+    if (!popup) return;
+
+    box(popup, 0, 0);
+    
+    // Title
+    wattron(popup, A_BOLD);
+    mvwprintw(popup, 0, 2, " HTTP Request ");
+    wattroff(popup, A_BOLD);
+
+    // Help text
+    mvwprintw(popup, 2, 2, "Examples:");
+    mvwprintw(popup, 3, 4, "GET httpbin.org/get");
+    mvwprintw(popup, 4, 4, "POST httpbin.org/post name=John age:=30");
+    mvwprintw(popup, 5, 4, "GET api.example.com Auth:\"Bearer token\"");
+    
+    mvwprintw(popup, 7, 2, "Enter request (Ctrl+E to execute, ESC to cancel):");
+
+    // More input lines for scrolling
+    #define MAX_REQUEST_LINES 10
+    char lines[MAX_REQUEST_LINES][256];
+    for (int i = 0; i < MAX_REQUEST_LINES; i++) {
+        lines[i][0] = '\0';
+    }
+    
+    int current_line = 0;
+    int pos = 0;
+    int scroll_offset = 0;
+    int visible_lines = 9; // Lines 9-17 in the popup (9 visible lines)
+    
+    // Don't enable echo - we'll manually display characters
+    curs_set(1);
+    keypad(popup, TRUE);
+    
+    http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
+                             scroll_offset, visible_lines, popup_width);
+    
+    while (1) {
+        int ch = wgetch(popup);
+        
+        if (ch == 5) { // Ctrl+E
+            break; // Execute
+        } else if (ch == '\n' || ch == KEY_ENTER) {
+            // Move to next line
+            if (current_line < MAX_REQUEST_LINES - 1) {
+                current_line++;
+                pos = strlen(lines[current_line]);
+                
+                // Scroll if needed
+                if (current_line - scroll_offset >= visible_lines) {
+                    scroll_offset++;
+                }
+                
+                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
+                                         scroll_offset, visible_lines, popup_width);
+            }
+        } else if (ch == 27) { // ESC
+            curs_set(0);
+            delwin(popup);
+            touchwin(stdscr);
+            refresh();
+            return;
+        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (pos > 0) {
+                pos--;
+                lines[current_line][pos] = '\0';
+                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
+                                         scroll_offset, visible_lines, popup_width);
+            } else if (current_line > 0) {
+                // Move to previous line
+                current_line--;
+                pos = strlen(lines[current_line]);
+                
+                // Scroll if needed
+                if (current_line < scroll_offset) {
+                    scroll_offset--;
+                }
+                
+                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
+                                         scroll_offset, visible_lines, popup_width);
+            }
+        } else if (ch == KEY_UP) {
+            if (current_line > 0) {
+                current_line--;
+                pos = strlen(lines[current_line]);
+                
+                // Scroll if needed
+                if (current_line < scroll_offset) {
+                    scroll_offset--;
+                }
+                
+                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
+                                         scroll_offset, visible_lines, popup_width);
+            }
+        } else if (ch == KEY_DOWN) {
+            if (current_line < MAX_REQUEST_LINES - 1) {
+                current_line++;
+                pos = strlen(lines[current_line]);
+                
+                // Scroll if needed
+                if (current_line - scroll_offset >= visible_lines) {
+                    scroll_offset++;
+                }
+                
+                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
+                                         scroll_offset, visible_lines, popup_width);
+            }
+        } else if (isprint(ch) && pos < 250) {
+            lines[current_line][pos++] = ch;
+            lines[current_line][pos] = '\0';
+            http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
+                                     scroll_offset, visible_lines, popup_width);
+        }
+    }
+    
+    curs_set(0);
+    delwin(popup);
+    touchwin(stdscr);
     refresh();
 
-    echo();
-    curs_set(1);
+    // Combine all non-empty lines into one request
+    char input[2048] = {0};
+    for (int i = 0; i < MAX_REQUEST_LINES; i++) {
+        // Trim whitespace
+        char *line = lines[i];
+        while (*line && isspace((unsigned char)*line)) line++;
+        if (*line == '\0') continue;
+        
+        int len = strlen(line);
+        while (len > 0 && isspace((unsigned char)line[len-1])) line[--len] = '\0';
+        
+        if (input[0] != '\0') strncat(input, " ", sizeof(input) - strlen(input) - 1);
+        strncat(input, line, sizeof(input) - strlen(input) - 1);
+    }
 
-    char input[512] = {0};
-    getnstr(input, sizeof(input) - 1);
-
-    noecho();
-    curs_set(0);
-
-    // Trim whitespace
+    // Trim final whitespace
     int len = (int)strlen(input);
     while (len > 0 && isspace((unsigned char)input[len - 1])) input[--len] = '\0';
 
