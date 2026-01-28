@@ -882,9 +882,12 @@ void copy_selection_to_clipboard(ViewerState *state) {
 void draw_tabbar(ViewerState *state) {
     int max_x = getmaxx(stdscr);
 
-    attron(COLOR_PAIR(COLOR_TABBAR));
-    mvhline(0, 0, ' ', max_x);
+    // Don't fill the line - let it be transparent
+    // Just move to the line and draw content
+    move(0, 0);
+    clrtoeol();  // Clear to end of line without filling
 
+    attron(COLOR_PAIR(COLOR_TABBAR));
     int x = 1;
     for (int i = 0; i < state->buffer_count; i++) {
         if (!state->buffers[i].is_active) continue;
@@ -906,6 +909,11 @@ void draw_tabbar(ViewerState *state) {
 
     mvprintw(0, max_x - 10, " [%d/%d] ", state->current_buffer + 1, state->buffer_count);
     attroff(COLOR_PAIR(COLOR_TABBAR));
+    
+    // Draw white horizontal line below tabbar
+    attron(COLOR_PAIR(COLOR_NORMAL));
+    mvhline(1, 0, ACS_HLINE, max_x);
+    attroff(COLOR_PAIR(COLOR_NORMAL));
 }
 
 void draw_status_bar(ViewerState *state) {
@@ -914,8 +922,16 @@ void draw_status_bar(ViewerState *state) {
 
     Buffer *buf = &state->buffers[state->current_buffer];
 
+    // Draw white horizontal line above status bar
+    attron(COLOR_PAIR(COLOR_NORMAL));
+    mvhline(max_y - 3, 0, ACS_HLINE, max_x);
+    attroff(COLOR_PAIR(COLOR_NORMAL));
+
+    // Clear the status line without filling
+    move(max_y - 2, 0);
+    clrtoeol();
+
     attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-    mvhline(max_y - 2, 0, ' ', max_x);
 
     const char *name = strrchr(buf->filepath, '/');
     if (!name) name = buf->filepath;
@@ -962,8 +978,8 @@ void draw_buffer(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
 
-    int content_start_y = 1;
-    int content_height = max_y - 3;
+    int content_start_y = 2;  // Changed from 1 to 2 to account for border line
+    int content_height = max_y - 4;  // Changed from max_y - 3 to max_y - 4
     int line_nr_width = state->show_line_numbers ? 6 : 0;
 
     if (state->wrap_enabled) {
@@ -1370,8 +1386,8 @@ int main(int argc, char *argv[]) {
         init_pair(COLOR_NUMBER,  COLOR_YELLOW, -1);
         init_pair(COLOR_TYPE,    COLOR_BLUE,   -1);
         init_pair(COLOR_FUNCTION,COLOR_YELLOW, -1);
-        init_pair(COLOR_TABBAR,  COLOR_BLACK,  COLOR_CYAN);
-        init_pair(COLOR_STATUS,  COLOR_BLACK,  COLOR_CYAN);
+        init_pair(COLOR_TABBAR,  COLOR_WHITE,  -1);  // White text on default background
+        init_pair(COLOR_STATUS,  COLOR_WHITE,  -1);  // White text on default background
         init_pair(COLOR_LINENR,  COLOR_YELLOW, -1);
         init_pair(COLOR_COPY_SELECT, COLOR_WHITE, COLOR_BLUE);
     }
