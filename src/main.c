@@ -1,6 +1,6 @@
 // peek.c
 // A tiny ncurses pager with multi-buffer, search, wrap toggle, line numbers, copy-mode,
-// and *man-page highlighting* (plus robust ANSI + overstrike cleanup so man output doesn't break).
+// HTTP request support, and *man-page highlighting* (plus robust ANSI + overstrike cleanup).
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <stdlib.h>
@@ -36,9 +36,11 @@ typedef struct {
     char *lines[MAX_LINES];
     int line_count;
     char filepath[1024];
+    char http_request[512];  // Store the HTTP request command if this is an HTTP buffer
     Language lang;
     int scroll_offset;
     int is_active;
+    int is_http_buffer;      // Flag to indicate this is an HTTP response buffer
 } Buffer;
 
 typedef struct {
@@ -94,6 +96,9 @@ static void usage(const char *prog) {
         "  d/u           Half-page down/up\n"
         "  /             Search\n"
         "  n/N           Next/previous match\n"
+        "  r             Make HTTP request\n"
+        "  R             Reload current HTTP buffer\n"
+        "  x             Close current buffer\n"
         "  o             Open file with fzf\n"
         "  Tab/Shift-Tab Switch buffers\n"
         "  L             Toggle line numbers\n"
@@ -487,6 +492,8 @@ int load_file(Buffer *buf, const char *filepath) {
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
     buf->lang = detect_language(filepath);
     buf->is_active = 1;
+    buf->is_http_buffer = 0;
+    buf->http_request[0] = '\0';
 
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), f) && buf->line_count < MAX_LINES) {
@@ -508,6 +515,8 @@ int load_stdin(Buffer *buf) {
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
     buf->lang = LANG_NONE;
     buf->is_active = 1;
+    buf->is_http_buffer = 0;
+    buf->http_request[0] = '\0';
 
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), stdin) && buf->line_count < MAX_LINES) {
@@ -532,6 +541,8 @@ static int load_command(Buffer *buf, const char *label, const char *cmd, Languag
     buf->scroll_offset = 0;
     buf->is_active = 1;
     buf->lang = lang;
+    buf->is_http_buffer = 0;
+    buf->http_request[0] = '\0';
 
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
@@ -574,6 +585,185 @@ void free_buffer(Buffer *buf) {
     }
     buf->line_count = 0;
     buf->is_active = 0;
+}
+
+// --- HTTP Request Functions -------------------------------------------------
+
+int load_http_response(Buffer *buf, const char *request_input) {
+    // Free existing buffer content
+    for (int i = 0; i < buf->line_count; i++) {
+        free(buf->lines[i]);
+        buf->lines[i] = NULL;
+    }
+    
+    buf->line_count = 0;
+    buf->scroll_offset = 0;
+    buf->is_active = 1;
+    buf->is_http_buffer = 1;
+    buf->lang = LANG_NONE;
+    
+    // Store the request for reload functionality
+    strncpy(buf->http_request, request_input, sizeof(buf->http_request) - 1);
+    buf->http_request[sizeof(buf->http_request) - 1] = '\0';
+    
+    // Build the command: xh with jq formatting, fallback to plain xh
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), 
+             "xh %s 2>&1 | jq . 2>/dev/null || xh %s 2>&1", 
+             request_input, request_input);
+    
+    // Create a label for the buffer
+    char label[256];
+    snprintf(label, sizeof(label), "[HTTP: %s]", request_input);
+    strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
+    buf->filepath[sizeof(buf->filepath) - 1] = '\0';
+    
+    // Execute the command and capture output
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    
+    char line[MAX_LINE_LEN];
+    while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        
+        strip_overstrikes(line);
+        strip_ansi(line);
+        rtrim(line);
+        
+        buf->lines[buf->line_count++] = strdup(line);
+    }
+    
+    int rc = pclose(p);
+    (void)rc;
+    
+    return (buf->line_count > 0) ? 0 : -1;
+}
+
+void prompt_http_request(ViewerState *state) {
+    int max_y = getmaxy(stdscr);
+    int max_x = getmaxx(stdscr);
+
+    attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+    mvhline(max_y - 2, 0, ' ', max_x);
+    mvprintw(max_y - 2, 1, "HTTP Request (e.g. GET api.example.com/path): ");
+    attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+
+    move(max_y - 2, 49);
+    refresh();
+
+    echo();
+    curs_set(1);
+
+    char input[512] = {0};
+    getnstr(input, sizeof(input) - 1);
+
+    noecho();
+    curs_set(0);
+
+    // Trim whitespace
+    int len = (int)strlen(input);
+    while (len > 0 && isspace((unsigned char)input[len - 1])) input[--len] = '\0';
+
+    if (input[0] == '\0') return;
+
+    // Create new buffer for HTTP response
+    if (state->buffer_count < MAX_BUFFERS) {
+        if (load_http_response(&state->buffers[state->buffer_count], input) == 0) {
+            state->current_buffer = state->buffer_count;
+            state->buffer_count++;
+        } else {
+            // Show error message briefly
+            attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+            mvhline(max_y - 2, 0, ' ', max_x);
+            mvprintw(max_y - 2, 1, "Failed to execute HTTP request");
+            attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+            refresh();
+            napms(1500);
+        }
+    } else {
+        // Buffer limit reached
+        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        mvhline(max_y - 2, 0, ' ', max_x);
+        mvprintw(max_y - 2, 1, "Maximum buffer limit reached");
+        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        refresh();
+        napms(1500);
+    }
+}
+
+void reload_http_buffer(ViewerState *state) {
+    int max_y = getmaxy(stdscr);
+    int max_x = getmaxx(stdscr);
+    
+    Buffer *buf = &state->buffers[state->current_buffer];
+    
+    if (!buf->is_http_buffer || buf->http_request[0] == '\0') {
+        // Not an HTTP buffer, show message
+        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        mvhline(max_y - 2, 0, ' ', max_x);
+        mvprintw(max_y - 2, 1, "Current buffer is not an HTTP response");
+        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        refresh();
+        napms(1500);
+        return;
+    }
+    
+    // Save the request string before reloading
+    char saved_request[512];
+    strncpy(saved_request, buf->http_request, sizeof(saved_request) - 1);
+    saved_request[sizeof(saved_request) - 1] = '\0';
+    
+    // Show loading message
+    attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+    mvhline(max_y - 2, 0, ' ', max_x);
+    mvprintw(max_y - 2, 1, "Reloading HTTP request...");
+    attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+    refresh();
+    
+    // Reload the request
+    if (load_http_response(buf, saved_request) != 0) {
+        // Show error message
+        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        mvhline(max_y - 2, 0, ' ', max_x);
+        mvprintw(max_y - 2, 1, "Failed to reload HTTP request");
+        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        refresh();
+        napms(1500);
+    }
+}
+
+void close_current_buffer(ViewerState *state) {
+    int max_y = getmaxy(stdscr);
+    int max_x = getmaxx(stdscr);
+    
+    if (state->buffer_count <= 1) {
+        // Can't close the last buffer
+        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        mvhline(max_y - 2, 0, ' ', max_x);
+        mvprintw(max_y - 2, 1, "Cannot close the last buffer");
+        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        refresh();
+        napms(1500);
+        return;
+    }
+    
+    int current = state->current_buffer;
+    
+    // Free the buffer
+    free_buffer(&state->buffers[current]);
+    
+    // Shift all buffers after this one down
+    for (int i = current; i < state->buffer_count - 1; i++) {
+        state->buffers[i] = state->buffers[i + 1];
+    }
+    
+    state->buffer_count--;
+    
+    // Adjust current buffer index
+    if (state->current_buffer >= state->buffer_count) {
+        state->current_buffer = state->buffer_count - 1;
+    }
 }
 
 // --- Search -----------------------------------------------------------------
@@ -735,11 +925,12 @@ void draw_status_bar(ViewerState *state) {
     const char *mode = state->copy_mode ? "VISUAL" : "NORMAL";
 
     char left[512];
-    snprintf(left, sizeof(left), " %s | %s | %d%% | %d/%d lines | L:%s W:%s",
+    snprintf(left, sizeof(left), " %s | %s | %d%% | %d/%d lines | L:%s W:%s%s",
              mode, name, percent,
              buf->scroll_offset + 1, buf->line_count,
              state->show_line_numbers ? "ON" : "OFF",
-             state->wrap_enabled ? "ON" : "OFF");
+             state->wrap_enabled ? "ON" : "OFF",
+             buf->is_http_buffer ? " | HTTP" : "");
 
     mvprintw(max_y - 2, 1, "%s", left);
 
@@ -762,7 +953,7 @@ void draw_help_line() {
     attron(COLOR_PAIR(COLOR_NORMAL));
     mvhline(max_y - 1, 0, ' ', max_x);
     mvprintw(max_y - 1, 1,
-             "j/k:scroll  g/G:top/bot  /:search  n/N:next/prev  l:line#  w:wrap  v:copy  y:yank  o:fzf  Tab:buf  q:quit");
+             "j/k:scroll  g/G:top/bot  /:search  n/N:next/prev  r:http  R:reload  x:close  l:line#  w:wrap  v:copy  y:yank  o:fzf  Tab:buf  q:quit");
     attroff(COLOR_PAIR(COLOR_NORMAL));
 }
 
@@ -870,6 +1061,19 @@ void handle_input(ViewerState *state, int *running) {
 
         case 27: // ESC
             if (state->copy_mode) state->copy_mode = 0;
+            break;
+
+        case 'r':
+            if (!state->copy_mode) prompt_http_request(state);
+            break;
+
+        case 'R':
+            if (!state->copy_mode) reload_http_buffer(state);
+            break;
+
+        case 'x':
+        case 'X':
+            if (!state->copy_mode) close_current_buffer(state);
             break;
 
         case 'v':
