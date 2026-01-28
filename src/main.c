@@ -609,7 +609,7 @@ int load_http_response(Buffer *buf, const char *request_input) {
     // Build the command: xh with jq formatting, fallback to plain xh
     char cmd[2048];
     snprintf(cmd, sizeof(cmd), 
-             "xh %s 2>&1 | jq . 2>/dev/null || xh %s 2>&1", 
+             "xh -v %s 2>&1 | jq . 2>/dev/null || xh %s 2>&1", 
              request_input, request_input);
     
     // Create a label for the buffer
