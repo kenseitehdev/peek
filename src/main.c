@@ -1,6 +1,6 @@
 // peek.c
 // A tiny ncurses pager with multi-buffer, search, wrap toggle, line numbers, copy-mode,
-// HTTP request support, and *man-page highlighting* (plus robust ANSI + overstrike cleanup).
+// HTTP request support, wget, w3m -dump, and extended language highlighting.
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <stdlib.h>
@@ -12,7 +12,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-
+#include <strings.h>
 #define MAX_BUFFERS 50
 #define MAX_LINES 10000
 #define MAX_LINE_LEN 2048
@@ -29,7 +29,15 @@ typedef enum {
     LANG_CSS,
     LANG_SHELL,
     LANG_MARKDOWN,
-    LANG_MAN
+    LANG_MAN,
+    LANG_RUST,
+    LANG_GO,
+    LANG_RUBY,
+    LANG_PHP,
+    LANG_SQL,
+    LANG_JSON,
+    LANG_XML,
+    LANG_YAML
 } Language;
 
 typedef struct {
@@ -89,6 +97,8 @@ static void usage(const char *prog) {
         "\n"
         "Optional explicit command mode:\n"
         "  %s -m \"man grep\" -m \"man sed\" file1\n"
+        "  %s -m \"wget -qO- https://example.com\" file1\n"
+        "  %s -m \"w3m -dump https://example.com\" file2\n"
         "\n"
         "Keybindings:\n"
         "  j/k           Scroll down/up\n"
@@ -98,16 +108,18 @@ static void usage(const char *prog) {
         "  n/N           Next/previous match\n"
         "  r             Make HTTP request (opens popup)\n"
         "  R             Reload current HTTP buffer\n"
+        "  w             Fetch URL with wget (opens popup)\n"
+        "  W             Fetch URL with w3m -dump (opens popup)\n"
         "  x             Close current buffer\n"
         "  o             Open file with fzf\n"
         "  Tab/Shift-Tab Switch buffers\n"
         "  L             Toggle line numbers\n"
-        "  W             Toggle line wrapping\n"
+        "  T             Toggle line wrapping\n"
         "  v             Enter visual/copy mode\n"
         "  y             Copy selection (in copy mode)\n"
         "  Esc           Exit copy mode / Cancel popup\n"
         "  q             Quit\n",
-        prog, prog, prog, prog, prog, prog
+        prog, prog, prog, prog, prog, prog, prog, prog
     );
 }
 
@@ -204,7 +216,7 @@ Language detect_language(const char *filepath) {
     if (!ext) return LANG_NONE;
 
     if (strcmp(ext, ".c") == 0 || strcmp(ext, ".h") == 0) return LANG_C;
-    if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 || strcmp(ext, ".hpp") == 0) return LANG_CPP;
+    if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 || strcmp(ext, ".hpp") == 0 || strcmp(ext, ".cxx") == 0) return LANG_CPP;
     if (strcmp(ext, ".py") == 0) return LANG_PYTHON;
     if (strcmp(ext, ".java") == 0) return LANG_JAVA;
     if (strcmp(ext, ".js") == 0) return LANG_JS;
@@ -213,6 +225,14 @@ Language detect_language(const char *filepath) {
     if (strcmp(ext, ".css") == 0) return LANG_CSS;
     if (strcmp(ext, ".sh") == 0 || strcmp(ext, ".bash") == 0 || strcmp(ext, ".zsh") == 0) return LANG_SHELL;
     if (strcmp(ext, ".md") == 0 || strcmp(ext, ".markdown") == 0) return LANG_MARKDOWN;
+    if (strcmp(ext, ".rs") == 0) return LANG_RUST;
+    if (strcmp(ext, ".go") == 0) return LANG_GO;
+    if (strcmp(ext, ".rb") == 0) return LANG_RUBY;
+    if (strcmp(ext, ".php") == 0) return LANG_PHP;
+    if (strcmp(ext, ".sql") == 0) return LANG_SQL;
+    if (strcmp(ext, ".json") == 0) return LANG_JSON;
+    if (strcmp(ext, ".xml") == 0) return LANG_XML;
+    if (strcmp(ext, ".yaml") == 0 || strcmp(ext, ".yml") == 0) return LANG_YAML;
 
     if (strstr(filepath, "/man/") || strstr(filepath, ".man")) return LANG_MAN;
     return LANG_NONE;
@@ -253,6 +273,76 @@ int is_js_keyword(const char *word) {
         NULL
     };
     for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    return 0;
+}
+
+int is_rust_keyword(const char *word) {
+    const char *keywords[] = {
+        "as","async","await","break","const","continue","crate","dyn",
+        "else","enum","extern","false","fn","for","if","impl","in",
+        "let","loop","match","mod","move","mut","pub","ref","return",
+        "self","Self","static","struct","super","trait","true","type",
+        "unsafe","use","where","while",
+        NULL
+    };
+    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    return 0;
+}
+
+int is_go_keyword(const char *word) {
+    const char *keywords[] = {
+        "break","case","chan","const","continue","default","defer","else",
+        "fallthrough","for","func","go","goto","if","import","interface",
+        "map","package","range","return","select","struct","switch","type",
+        "var",
+        NULL
+    };
+    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    return 0;
+}
+
+int is_ruby_keyword(const char *word) {
+    const char *keywords[] = {
+        "BEGIN","END","alias","and","begin","break","case","class",
+        "def","defined?","do","else","elsif","end","ensure","false",
+        "for","if","in","module","next","nil","not","or","redo",
+        "rescue","retry","return","self","super","then","true","undef",
+        "unless","until","when","while","yield",
+        NULL
+    };
+    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    return 0;
+}
+
+int is_php_keyword(const char *word) {
+    const char *keywords[] = {
+        "abstract","and","array","as","break","callable","case","catch",
+        "class","clone","const","continue","declare","default","die","do",
+        "echo","else","elseif","empty","enddeclare","endfor","endforeach",
+        "endif","endswitch","endwhile","eval","exit","extends","final",
+        "finally","for","foreach","function","global","goto","if","implements",
+        "include","include_once","instanceof","insteadof","interface","isset",
+        "list","namespace","new","or","print","private","protected","public",
+        "require","require_once","return","static","switch","throw","trait",
+        "try","unset","use","var","while","xor","yield",
+        NULL
+    };
+    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    return 0;
+}
+
+int is_sql_keyword(const char *word) {
+    const char *keywords[] = {
+        "SELECT","FROM","WHERE","INSERT","UPDATE","DELETE","CREATE","DROP",
+        "ALTER","TABLE","INDEX","VIEW","JOIN","INNER","LEFT","RIGHT","OUTER",
+        "ON","AND","OR","NOT","NULL","IS","IN","LIKE","BETWEEN","ORDER","BY",
+        "GROUP","HAVING","LIMIT","OFFSET","AS","DISTINCT","COUNT","SUM","AVG",
+        "MAX","MIN","UNION","ALL","EXISTS","CASE","WHEN","THEN","ELSE","END",
+        NULL
+    };
+    for (int i = 0; keywords[i]; i++) {
+        if (strcasecmp(word, keywords[i]) == 0) return 1;
+    }
     return 0;
 }
 
@@ -412,7 +502,9 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
     while (i < len && col < line_width) {
         char ch = line[i];
 
-        if ((lang == LANG_C || lang == LANG_CPP || lang == LANG_JAVA || lang == LANG_JS || lang == LANG_TS || lang == LANG_CSS) &&
+        // C-style comments
+        if ((lang == LANG_C || lang == LANG_CPP || lang == LANG_JAVA || lang == LANG_JS || 
+             lang == LANG_TS || lang == LANG_CSS || lang == LANG_RUST || lang == LANG_GO || lang == LANG_PHP) &&
             i + 1 < len && line[i] == '/' && line[i+1] == '/') {
             attron(COLOR_PAIR(COLOR_COMMENT));
             int j = i;
@@ -421,7 +513,9 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             break;
         }
 
-        if ((lang == LANG_PYTHON || lang == LANG_SHELL) && ch == '#') {
+        // Hash comments
+        if ((lang == LANG_PYTHON || lang == LANG_SHELL || lang == LANG_RUBY || 
+             lang == LANG_YAML || lang == LANG_PHP) && ch == '#') {
             attron(COLOR_PAIR(COLOR_COMMENT));
             int j = i;
             while (j < len && col < line_width) mvaddch(y, col++, line[j++]);
@@ -429,6 +523,16 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             break;
         }
 
+        // SQL comments
+        if (lang == LANG_SQL && i + 1 < len && line[i] == '-' && line[i+1] == '-') {
+            attron(COLOR_PAIR(COLOR_COMMENT));
+            int j = i;
+            while (j < len && col < line_width) mvaddch(y, col++, line[j++]);
+            attroff(COLOR_PAIR(COLOR_COMMENT));
+            break;
+        }
+
+        // String literals
         if (ch == '"' || ch == '\'') {
             char quote = ch;
             attron(COLOR_PAIR(COLOR_STRING));
@@ -444,16 +548,21 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             continue;
         }
 
+        // Numbers
         if (isdigit((unsigned char)ch)) {
             attron(COLOR_PAIR(COLOR_NUMBER));
             while (i < len && col < line_width &&
-                   (isdigit((unsigned char)line[i]) || line[i] == '.')) {
+                   (isdigit((unsigned char)line[i]) || line[i] == '.' || 
+                    line[i] == 'x' || line[i] == 'X' || 
+                    (line[i] >= 'a' && line[i] <= 'f') ||
+                    (line[i] >= 'A' && line[i] <= 'F'))) {
                 mvaddch(y, col++, line[i++]);
             }
             attroff(COLOR_PAIR(COLOR_NUMBER));
             continue;
         }
 
+        // Keywords and identifiers
         if (isalpha((unsigned char)ch) || ch == '_') {
             char word[128] = {0};
             int w = 0;
@@ -466,6 +575,11 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             if (lang == LANG_C || lang == LANG_CPP) is_keyword = is_c_keyword(word);
             else if (lang == LANG_PYTHON) is_keyword = is_python_keyword(word);
             else if (lang == LANG_JS || lang == LANG_TS) is_keyword = is_js_keyword(word);
+            else if (lang == LANG_RUST) is_keyword = is_rust_keyword(word);
+            else if (lang == LANG_GO) is_keyword = is_go_keyword(word);
+            else if (lang == LANG_RUBY) is_keyword = is_ruby_keyword(word);
+            else if (lang == LANG_PHP) is_keyword = is_php_keyword(word);
+            else if (lang == LANG_SQL) is_keyword = is_sql_keyword(word);
 
             if (is_keyword) attron(COLOR_PAIR(COLOR_KEYWORD) | A_BOLD);
 
@@ -641,6 +755,216 @@ int load_http_response(Buffer *buf, const char *request_input) {
     (void)rc;
     
     return (buf->line_count > 0) ? 0 : -1;
+}
+
+// --- wget support -----------------------------------------------------------
+
+int load_wget_response(Buffer *buf, const char *url) {
+    // Free existing buffer content
+    for (int i = 0; i < buf->line_count; i++) {
+        free(buf->lines[i]);
+        buf->lines[i] = NULL;
+    }
+    
+    buf->line_count = 0;
+    buf->scroll_offset = 0;
+    buf->is_active = 1;
+    buf->is_http_buffer = 1;
+    buf->lang = LANG_NONE;
+    
+    // Store the URL for reload functionality
+    strncpy(buf->http_request, url, sizeof(buf->http_request) - 1);
+    buf->http_request[sizeof(buf->http_request) - 1] = '\0';
+    
+    // Build wget command
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "wget -qO- '%s' 2>&1", url);
+    
+    // Create a label for the buffer
+    char label[256];
+    snprintf(label, sizeof(label), "[wget: %s]", url);
+    strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
+    buf->filepath[sizeof(buf->filepath) - 1] = '\0';
+    
+    // Execute the command and capture output
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    
+    char line[MAX_LINE_LEN];
+    while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        
+        strip_overstrikes(line);
+        strip_ansi(line);
+        rtrim(line);
+        
+        buf->lines[buf->line_count++] = strdup(line);
+    }
+    
+    int rc = pclose(p);
+    (void)rc;
+    
+    return (buf->line_count > 0) ? 0 : -1;
+}
+
+// --- w3m -dump support ------------------------------------------------------
+
+int load_w3m_response(Buffer *buf, const char *url) {
+    // Free existing buffer content
+    for (int i = 0; i < buf->line_count; i++) {
+        free(buf->lines[i]);
+        buf->lines[i] = NULL;
+    }
+    
+    buf->line_count = 0;
+    buf->scroll_offset = 0;
+    buf->is_active = 1;
+    buf->is_http_buffer = 1;
+    buf->lang = LANG_NONE;
+    
+    // Store the URL for reload functionality
+    strncpy(buf->http_request, url, sizeof(buf->http_request) - 1);
+    buf->http_request[sizeof(buf->http_request) - 1] = '\0';
+    
+    // Build w3m command
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "w3m -dump '%s' 2>&1", url);
+    
+    // Create a label for the buffer
+    char label[256];
+    snprintf(label, sizeof(label), "[w3m: %s]", url);
+    strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
+    buf->filepath[sizeof(buf->filepath) - 1] = '\0';
+    
+    // Execute the command and capture output
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    
+    char line[MAX_LINE_LEN];
+    while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        
+        strip_overstrikes(line);
+        strip_ansi(line);
+        rtrim(line);
+        
+        buf->lines[buf->line_count++] = strdup(line);
+    }
+    
+    int rc = pclose(p);
+    (void)rc;
+    
+    return (buf->line_count > 0) ? 0 : -1;
+}
+
+// --- URL input popup --------------------------------------------------------
+
+void prompt_url(ViewerState *state, const char *tool_name, 
+                int (*loader_func)(Buffer*, const char*)) {
+    int max_y = getmaxy(stdscr);
+    int max_x = getmaxx(stdscr);
+
+    // Create popup window
+    int popup_height = 10;
+    int popup_width = 70;
+    int start_y = (max_y - popup_height) / 2;
+    int start_x = (max_x - popup_width) / 2;
+
+    WINDOW *popup = newwin(popup_height, popup_width, start_y, start_x);
+    if (!popup) return;
+
+    box(popup, 0, 0);
+    
+    // Title
+    wattron(popup, A_BOLD);
+    char title[64];
+    snprintf(title, sizeof(title), " %s URL Fetch ", tool_name);
+    mvwprintw(popup, 0, 2, "%s", title);
+    wattroff(popup, A_BOLD);
+
+    // Help text
+    mvwprintw(popup, 2, 2, "Examples:");
+    mvwprintw(popup, 3, 4, "https://example.com");
+    mvwprintw(popup, 4, 4, "http://httpbin.org/get");
+    
+    mvwprintw(popup, 6, 2, "Enter URL (Enter to fetch, ESC to cancel):");
+    mvwprintw(popup, 8, 2, ">");
+    
+    curs_set(1);
+    keypad(popup, TRUE);
+    
+    char input[512] = {0};
+    int pos = 0;
+    
+    wmove(popup, 8, 4);
+    wrefresh(popup);
+    
+    while (1) {
+        int ch = wgetch(popup);
+        
+        if (ch == '\n' || ch == KEY_ENTER) {
+            break; // Execute
+        } else if (ch == 27) { // ESC
+            curs_set(0);
+            delwin(popup);
+            touchwin(stdscr);
+            refresh();
+            return;
+        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (pos > 0) {
+                pos--;
+                input[pos] = '\0';
+                mvwhline(popup, 8, 4, ' ', popup_width - 6);
+                mvwprintw(popup, 8, 4, "%s", input);
+                wmove(popup, 8, 4 + pos);
+                wrefresh(popup);
+            }
+        } else if (isprint(ch) && pos < 500) {
+            input[pos++] = ch;
+            input[pos] = '\0';
+            mvwprintw(popup, 8, 4, "%s", input);
+            wrefresh(popup);
+        }
+    }
+    
+    curs_set(0);
+    delwin(popup);
+    touchwin(stdscr);
+    refresh();
+
+    // Trim whitespace
+    char *url = input;
+    while (*url && isspace((unsigned char)*url)) url++;
+    if (*url == '\0') return;
+    
+    int len = strlen(url);
+    while (len > 0 && isspace((unsigned char)url[len-1])) url[--len] = '\0';
+
+    // Create new buffer for response
+    if (state->buffer_count < MAX_BUFFERS) {
+        if (loader_func(&state->buffers[state->buffer_count], url) == 0) {
+            state->current_buffer = state->buffer_count;
+            state->buffer_count++;
+        } else {
+            // Show error message briefly
+            attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+            mvhline(max_y - 2, 0, ' ', max_x);
+            mvprintw(max_y - 2, 1, "Failed to fetch URL with %s", tool_name);
+            attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+            refresh();
+            napms(1500);
+        }
+    } else {
+        // Buffer limit reached
+        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        mvhline(max_y - 2, 0, ' ', max_x);
+        mvprintw(max_y - 2, 1, "Maximum buffer limit reached");
+        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        refresh();
+        napms(1500);
+    }
 }
 
 // Helper function for HTTP request popup to redraw visible lines
@@ -876,8 +1200,17 @@ void reload_http_buffer(ViewerState *state) {
     attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
     refresh();
     
-    // Reload the request
-    if (load_http_response(buf, saved_request) != 0) {
+    // Determine which loader to use based on the buffer label
+    int result = -1;
+    if (strstr(buf->filepath, "[wget:") != NULL) {
+        result = load_wget_response(buf, saved_request);
+    } else if (strstr(buf->filepath, "[w3m:") != NULL) {
+        result = load_w3m_response(buf, saved_request);
+    } else {
+        result = load_http_response(buf, saved_request);
+    }
+    
+    if (result != 0) {
         // Show error message
         attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         mvhline(max_y - 2, 0, ' ', max_x);
@@ -1124,7 +1457,7 @@ void draw_help_line() {
     attron(COLOR_PAIR(COLOR_NORMAL));
     mvhline(max_y - 1, 0, ' ', max_x);
     mvprintw(max_y - 1, 1,
-             "j/k:scroll  g/G:top/bot  /:search  n/N:next/prev  r:http  R:reload  x:close  l:line#  w:wrap  v:copy  y:yank  o:fzf  Tab:buf  q:quit");
+             "j/k:scroll  g/G:top/bot  /:search  n/N:next/prev  r:http  R:reload  w:wget  W:w3m  x:close  l:line#  t:wrap  v:copy  y:yank  o:fzf  Tab:buf  q:quit");
     attroff(COLOR_PAIR(COLOR_NORMAL));
 }
 
@@ -1242,6 +1575,14 @@ void handle_input(ViewerState *state, int *running) {
             if (!state->copy_mode) reload_http_buffer(state);
             break;
 
+        case 'w':
+            if (!state->copy_mode) prompt_url(state, "wget", load_wget_response);
+            break;
+
+        case 'W':
+            if (!state->copy_mode) prompt_url(state, "w3m", load_w3m_response);
+            break;
+
         case 'x':
         case 'X':
             if (!state->copy_mode) close_current_buffer(state);
@@ -1267,8 +1608,8 @@ void handle_input(ViewerState *state, int *running) {
             state->show_line_numbers = !state->show_line_numbers;
             break;
 
-        case 'w':    
-        case 'W':
+        case 't':    
+        case 'T':
             state->wrap_enabled = !state->wrap_enabled;
             break;
 
@@ -1541,8 +1882,8 @@ int main(int argc, char *argv[]) {
         init_pair(COLOR_NUMBER,  COLOR_YELLOW, -1);
         init_pair(COLOR_TYPE,    COLOR_BLUE,   -1);
         init_pair(COLOR_FUNCTION,COLOR_YELLOW, -1);
-        init_pair(COLOR_TABBAR,  COLOR_WHITE,  -1);  // White text on default background
-        init_pair(COLOR_STATUS,  COLOR_WHITE,  -1);  // White text on default background
+        init_pair(COLOR_TABBAR,  COLOR_WHITE,  -1);
+        init_pair(COLOR_STATUS,  COLOR_WHITE,  -1);
         init_pair(COLOR_LINENR,  COLOR_YELLOW, -1);
         init_pair(COLOR_COPY_SELECT, COLOR_WHITE, COLOR_BLUE);
     }
