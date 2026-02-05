@@ -1,6 +1,6 @@
 // peek.c
 // A tiny ncurses pager with multi-buffer, search, wrap toggle, line numbers, copy-mode,
-// HTTP request support, wget, w3m -dump, and extended language highlighting.
+// HTTP request support, wget, w3m -dump, SQL query support, and extended language highlighting.
 #define _POSIX_C_SOURCE 200809L
 #include <ncurses.h>
 #include <stdlib.h>
@@ -110,6 +110,7 @@ static void usage(const char *prog) {
         "  R             Reload current HTTP buffer\n"
         "  w             Fetch URL with wget (opens popup)\n"
         "  W             Fetch URL with w3m -dump (opens popup)\n"
+        "  s             SQL query (opens popup)\n"
         "  x             Close current buffer\n"
         "  o             Open file with fzf\n"
         "  Tab/Shift-Tab Switch buffers\n"
@@ -859,6 +860,339 @@ int load_w3m_response(Buffer *buf, const char *url) {
     return (buf->line_count > 0) ? 0 : -1;
 }
 
+// --- SQL Database Support ---------------------------------------------------
+
+int load_sql_response(Buffer *buf, const char *db_type, const char *connection, const char *query) {
+    // Free existing buffer content
+    for (int i = 0; i < buf->line_count; i++) {
+        free(buf->lines[i]);
+        buf->lines[i] = NULL;
+    }
+    
+    buf->line_count = 0;
+    buf->scroll_offset = 0;
+    buf->is_active = 1;
+    buf->is_http_buffer = 0;
+    buf->lang = LANG_NONE;
+    
+    char cmd[4096];
+    int have_vd = cmd_exists("vd");
+    
+    if (strcmp(db_type, "sqlite") == 0) {
+        if (have_vd) {
+            // VisiData with nice table formatting
+            // Create temp file for query
+            char tmpfile[] = "/tmp/peek_sql_XXXXXX";
+            int fd = mkstemp(tmpfile);
+            if (fd != -1) {
+                FILE *f = fdopen(fd, "w");
+                if (f) {
+                    fprintf(f, "%s", query);
+                    fclose(f);
+                    
+                    // Use vd in batch mode with txt output format
+                    snprintf(cmd, sizeof(cmd),
+                             "vd --batch --output-encoding=utf-8 -f txt "
+                             "'sqlite:///%s' --exec ':source %s' 2>&1 || "
+                             "sqlite3 -header -box '%s' \"%s\" 2>&1",
+                             connection, tmpfile, connection, query);
+                    unlink(tmpfile);
+                } else {
+                    close(fd);
+                    unlink(tmpfile);
+                    // Fallback to sqlite3
+                    snprintf(cmd, sizeof(cmd),
+                             "sqlite3 -header -box '%s' \"%s\" 2>&1",
+                             connection, query);
+                }
+            } else {
+                // Fallback to sqlite3
+                snprintf(cmd, sizeof(cmd),
+                         "sqlite3 -header -box '%s' \"%s\" 2>&1",
+                         connection, query);
+            }
+        } else {
+            // Fallback: use sqlite3 with box borders
+            snprintf(cmd, sizeof(cmd),
+                     "sqlite3 -header -box '%s' \"%s\" 2>&1",
+                     connection, query);
+        }
+    } else if (strcmp(db_type, "postgres") == 0 || strcmp(db_type, "postgresql") == 0) {
+        if (have_vd) {
+            // VisiData with PostgreSQL
+            char tmpfile[] = "/tmp/peek_sql_XXXXXX";
+            int fd = mkstemp(tmpfile);
+            if (fd != -1) {
+                FILE *f = fdopen(fd, "w");
+                if (f) {
+                    fprintf(f, "%s", query);
+                    fclose(f);
+                    
+                    snprintf(cmd, sizeof(cmd),
+                             "vd --batch --output-encoding=utf-8 -f txt "
+                             "'%s' --exec ':source %s' 2>&1 || "
+                             "psql '%s' --pset=border=2 -c \"%s\" 2>&1",
+                             connection, tmpfile, connection, query);
+                    unlink(tmpfile);
+                } else {
+                    close(fd);
+                    unlink(tmpfile);
+                    // Fallback to psql
+                    snprintf(cmd, sizeof(cmd),
+                             "psql '%s' --pset=border=2 -c \"%s\" 2>&1",
+                             connection, query);
+                }
+            } else {
+                // Fallback to psql
+                snprintf(cmd, sizeof(cmd),
+                         "psql '%s' --pset=border=2 -c \"%s\" 2>&1",
+                         connection, query);
+            }
+        } else {
+            // Fallback: use psql with border=2
+            snprintf(cmd, sizeof(cmd),
+                     "psql '%s' --pset=border=2 -c \"%s\" 2>&1",
+                     connection, query);
+        }
+    } else {
+        return -1;
+    }
+    
+    // Create a label for the buffer
+    char label[256];
+    snprintf(label, sizeof(label), "[SQL:%s]", db_type);
+    strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
+    buf->filepath[sizeof(buf->filepath) - 1] = '\0';
+    
+    // Store query for potential reload
+    strncpy(buf->http_request, query, sizeof(buf->http_request) - 1);
+    buf->http_request[sizeof(buf->http_request) - 1] = '\0';
+    
+    // Execute the command and capture output
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    
+    char line[MAX_LINE_LEN];
+    while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        
+        strip_overstrikes(line);
+        strip_ansi(line);
+        rtrim(line);
+        
+        buf->lines[buf->line_count++] = strdup(line);
+    }
+    
+    int rc = pclose(p);
+    (void)rc;
+    
+    return (buf->line_count > 0) ? 0 : -1;
+}
+
+void prompt_sql_query(ViewerState *state) {
+    int max_y = getmaxy(stdscr);
+    int max_x = getmaxx(stdscr);
+
+    // Create popup window
+    int popup_height = 24;
+    int popup_width = 70;
+    int start_y = (max_y - popup_height) / 2;
+    int start_x = (max_x - popup_width) / 2;
+
+    WINDOW *popup = newwin(popup_height, popup_width, start_y, start_x);
+    if (!popup) return;
+
+    box(popup, 0, 0);
+    
+    // Title
+    wattron(popup, A_BOLD);
+    mvwprintw(popup, 0, 2, " SQL Query ");
+    wattroff(popup, A_BOLD);
+
+    // Help text
+    mvwprintw(popup, 2, 2, "Database Type (1=SQLite, 2=PostgreSQL):");
+    mvwprintw(popup, 4, 2, "Connection:");
+    mvwprintw(popup, 5, 4, "SQLite: /path/to/database.db");
+    mvwprintw(popup, 6, 4, "PostgreSQL: postgresql://user:pass@host/db");
+    mvwprintw(popup, 8, 2, "SQL Query (Ctrl+E to execute, ESC to cancel):");
+    
+    curs_set(1);
+    keypad(popup, TRUE);
+    
+    // Get database type
+    mvwprintw(popup, 2, 44, ">");
+    wrefresh(popup);
+    
+    int db_choice = wgetch(popup);
+    char db_type[32] = "sqlite";
+    
+    if (db_choice == '2') {
+        strcpy(db_type, "postgres");
+        mvwprintw(popup, 2, 46, "PostgreSQL");
+    } else {
+        mvwprintw(popup, 2, 46, "SQLite");
+    }
+    wrefresh(popup);
+    
+    // Get connection string
+    mvwprintw(popup, 4, 14, ">");
+    wmove(popup, 4, 16);
+    wrefresh(popup);
+    
+    char connection[512] = {0};
+    int conn_pos = 0;
+    
+    while (1) {
+        int ch = wgetch(popup);
+        if (ch == '\n' || ch == KEY_ENTER) break;
+        else if (ch == 27) { // ESC
+            curs_set(0);
+            delwin(popup);
+            touchwin(stdscr);
+            refresh();
+            return;
+        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (conn_pos > 0) {
+                conn_pos--;
+                connection[conn_pos] = '\0';
+                mvwhline(popup, 4, 16, ' ', popup_width - 18);
+                mvwprintw(popup, 4, 16, "%s", connection);
+                wmove(popup, 4, 16 + conn_pos);
+                wrefresh(popup);
+            }
+        } else if (isprint(ch) && conn_pos < 500) {
+            connection[conn_pos++] = ch;
+            connection[conn_pos] = '\0';
+            mvwprintw(popup, 4, 16, "%s", connection);
+            wrefresh(popup);
+        }
+    }
+    
+    // Get SQL query (multi-line)
+    #define MAX_SQL_LINES 12
+    char lines[MAX_SQL_LINES][256];
+    for (int i = 0; i < MAX_SQL_LINES; i++) {
+        lines[i][0] = '\0';
+    }
+    
+    int current_line = 0;
+    int pos = 0;
+    int scroll_offset = 0;
+    int visible_lines = 12;
+    
+    // Redraw query area
+    for (int i = 0; i < visible_lines; i++) {
+        int y = 10 + i;
+        mvwhline(popup, y, 2, ' ', popup_width - 3);
+        mvwprintw(popup, y, 2, ">");
+    }
+    wmove(popup, 10, 4);
+    wrefresh(popup);
+    
+    while (1) {
+        int ch = wgetch(popup);
+        
+        if (ch == 5) { // Ctrl+E
+            break;
+        } else if (ch == '\n' || ch == KEY_ENTER) {
+            if (current_line < MAX_SQL_LINES - 1) {
+                current_line++;
+                pos = strlen(lines[current_line]);
+                if (current_line - scroll_offset >= visible_lines) {
+                    scroll_offset++;
+                }
+                
+                // Redraw
+                for (int i = 0; i < visible_lines; i++) {
+                    int line_idx = scroll_offset + i;
+                    int y = 10 + i;
+                    mvwhline(popup, y, 2, ' ', popup_width - 3);
+                    if (line_idx < MAX_SQL_LINES) {
+                        mvwprintw(popup, y, 2, ">");
+                        if (lines[line_idx][0] != '\0') {
+                            mvwprintw(popup, y, 4, "%s", lines[line_idx]);
+                        }
+                    }
+                }
+                wmove(popup, 10 + (current_line - scroll_offset), 4 + pos);
+                wrefresh(popup);
+            }
+        } else if (ch == 27) { // ESC
+            curs_set(0);
+            delwin(popup);
+            touchwin(stdscr);
+            refresh();
+            return;
+        } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            if (pos > 0) {
+                pos--;
+                lines[current_line][pos] = '\0';
+            } else if (current_line > 0) {
+                current_line--;
+                pos = strlen(lines[current_line]);
+                if (current_line < scroll_offset) scroll_offset--;
+            }
+            
+            // Redraw
+            for (int i = 0; i < visible_lines; i++) {
+                int line_idx = scroll_offset + i;
+                int y = 10 + i;
+                mvwhline(popup, y, 2, ' ', popup_width - 3);
+                if (line_idx < MAX_SQL_LINES) {
+                    mvwprintw(popup, y, 2, ">");
+                    if (lines[line_idx][0] != '\0') {
+                        mvwprintw(popup, y, 4, "%s", lines[line_idx]);
+                    }
+                }
+            }
+            wmove(popup, 10 + (current_line - scroll_offset), 4 + pos);
+            wrefresh(popup);
+        } else if (isprint(ch) && pos < 250) {
+            lines[current_line][pos++] = ch;
+            lines[current_line][pos] = '\0';
+            mvwprintw(popup, 10 + (current_line - scroll_offset), 4, "%s", lines[current_line]);
+            wrefresh(popup);
+        }
+    }
+    
+    curs_set(0);
+    delwin(popup);
+    touchwin(stdscr);
+    refresh();
+
+    // Combine all lines into one query
+    char query[2048] = {0};
+    for (int i = 0; i < MAX_SQL_LINES; i++) {
+        char *line = lines[i];
+        while (*line && isspace((unsigned char)*line)) line++;
+        if (*line == '\0') continue;
+        
+        int len = strlen(line);
+        while (len > 0 && isspace((unsigned char)line[len-1])) line[--len] = '\0';
+        
+        if (query[0] != '\0') strncat(query, " ", sizeof(query) - strlen(query) - 1);
+        strncat(query, line, sizeof(query) - strlen(query) - 1);
+    }
+
+    if (query[0] == '\0' || connection[0] == '\0') return;
+
+    // Execute SQL query
+    if (state->buffer_count < MAX_BUFFERS) {
+        if (load_sql_response(&state->buffers[state->buffer_count], db_type, connection, query) == 0) {
+            state->current_buffer = state->buffer_count;
+            state->buffer_count++;
+        } else {
+            attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+            mvhline(max_y - 2, 0, ' ', max_x);
+            mvprintw(max_y - 2, 1, "Failed to execute SQL query");
+            attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+            refresh();
+            napms(1500);
+        }
+    }
+}
+
 // --- URL input popup --------------------------------------------------------
 
 void prompt_url(ViewerState *state, const char *tool_name, 
@@ -1457,7 +1791,7 @@ void draw_help_line() {
     attron(COLOR_PAIR(COLOR_NORMAL));
     mvhline(max_y - 1, 0, ' ', max_x);
     mvprintw(max_y - 1, 1,
-             "j/k:scroll  g/G:top/bot  /:search  n/N:next/prev  r:http  R:reload  w:wget  W:w3m  x:close  l:line#  t:wrap  v:copy  y:yank  o:fzf  Tab:buf  q:quit");
+             "j/k:scroll  /:search  r:http  w:wget  s:sql  x:close  l:line#  t:wrap  v:copy  Tab:buf  q:quit");
     attroff(COLOR_PAIR(COLOR_NORMAL));
 }
 
@@ -1466,8 +1800,8 @@ void draw_buffer(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
 
-    int content_start_y = 2;  // Changed from 1 to 2 to account for border line
-    int content_height = max_y - 4;  // Changed from max_y - 3 to max_y - 4
+    int content_start_y = 2;
+    int content_height = max_y - 4;
     int line_nr_width = state->show_line_numbers ? 6 : 0;
 
     if (state->wrap_enabled) {
@@ -1558,6 +1892,11 @@ void handle_input(ViewerState *state, int *running) {
     Buffer *buf = &state->buffers[state->current_buffer];
 
     switch (ch) {
+        case 's':
+        case 'S':
+            if (!state->copy_mode) prompt_sql_query(state);
+            break;
+            
         case 'q':
         case 'Q':
             if (!state->copy_mode) *running = 0;
@@ -1715,7 +2054,6 @@ void handle_input(ViewerState *state, int *running) {
             break;
     }
 }
-
 // --- main -------------------------------------------------------------------
 
 int main(int argc, char *argv[]) {
