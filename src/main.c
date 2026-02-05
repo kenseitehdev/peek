@@ -1763,7 +1763,7 @@ void draw_status_bar(ViewerState *state) {
     const char *mode = state->copy_mode ? "VISUAL" : "NORMAL";
 
     char left[512];
-    snprintf(left, sizeof(left), "NBL | %s | %s | %d%% | %d/%d lines | L:%s W:%s%s",
+    snprintf(left, sizeof(left), "NBL Peek | %s | %s | %d%% | %d/%d lines | L:%s W:%s%s",
              mode, name, percent,
              buf->scroll_offset + 1, buf->line_count,
              state->show_line_numbers ? "ON" : "OFF",
