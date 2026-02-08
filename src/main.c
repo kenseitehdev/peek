@@ -67,7 +67,7 @@ typedef struct {
     int copy_start_line;
     int copy_end_line;
     int horiz_scroll_offset;    // Horizontal scroll position
-    int horiz_scroll_step;   
+    int horiz_scroll_step;
 } ViewerState;
 
 // Color pairs
@@ -170,6 +170,19 @@ static int cmd_exists(const char *name) {
 // --- Cleanup helpers ---------------------------------------------------------
 
 // Strip classic man overstrikes (bold/underline via backspace patterns)
+static void trim_newlines(char *s) {
+    if (!s) return;
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r')) {
+        s[--len] = '\0';
+    }
+}
+
+static int check_command_exists(const char *cmd) {
+    char test[256];
+    snprintf(test, sizeof(test), "command -v %s >/dev/null 2>&1", cmd);
+    return system(test) == 0;
+}
 static void strip_overstrikes(char *s) {
     char *dst = s;
     for (char *src = s; *src; src++) {
@@ -614,35 +627,35 @@ int load_file(Buffer *buf, const char *filepath) {
             buf->is_active = 1;
             buf->is_http_buffer = 0;
             buf->http_request[0] = '\0';
-            
+
             char cmd[2048];
             snprintf(cmd, sizeof(cmd), "pdftotext -layout '%s' - 2>/dev/null", filepath);
-            
+
             FILE *p = popen(cmd, "r");
             if (!p) return -1;
-            
+
             char line[MAX_LINE_LEN];
             while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
                 size_t len = strlen(line);
                 while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-                
+
                 strip_overstrikes(line);
                 strip_ansi(line);
                 rtrim(line);
-                
+
                 buf->lines[buf->line_count++] = strdup(line);
             }
-            
+
             int rc = pclose(p);
             (void)rc;
-            
+
             return (buf->line_count > 0) ? 0 : -1;
         } else {
             fprintf(stderr, "Warning: pdftotext not found. Install poppler-utils to view PDFs.\n");
             return -1;
         }
     }
-    
+
     // Regular file handling
     FILE *f = fopen(filepath, "r");
     if (!f) return -1;
@@ -692,7 +705,109 @@ int load_stdin(Buffer *buf) {
 
     return buf->line_count > 0 ? 0 : -1;
 }
+static int pick_file_for_peek(char *out, size_t out_len) {
+    int have_nfzf = check_command_exists("nfzf");
+    int have_fzf  = check_command_exists("fzf");
 
+    if (!have_nfzf && !have_fzf) {
+        // Manual fallback
+        def_prog_mode();
+        endwin();
+        
+        char input[1024] = {0};
+        printf("\nEnter file path to open: ");
+        fflush(stdout);
+        
+        if (!fgets(input, sizeof(input), stdin)) {
+            reset_prog_mode();
+            refresh();
+            return 0;
+        }
+        
+        reset_prog_mode();
+        refresh();
+        
+        trim_newlines(input);
+        if (input[0] == '\0') return 0;
+        
+        strncpy(out, input, out_len - 1);
+        out[out_len - 1] = '\0';
+        return 1;
+    }
+
+    char cwd[1024];
+    if (!getcwd(cwd, sizeof(cwd))) return 0;
+
+    char tmp_template[] = "/tmp/peek_pick_XXXXXX";
+    int fd = mkstemp(tmp_template);
+    if (fd < 0) return 0;
+    close(fd);
+
+    int has_fd = check_command_exists("fd");
+    char cmd[8192];
+    
+    if (has_fd) {
+        const char *find_cmd = "fd -L -t f . --exclude .git --exclude node_modules "
+                               "--exclude build --exclude dist --exclude .cache 2>/dev/null";
+        
+        if (have_nfzf) {
+            snprintf(cmd, sizeof(cmd),
+                     "cd '%s' && %s | nfzf > \"%s\" 2>/dev/null",
+                     cwd, find_cmd, tmp_template);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                     "cd '%s' && %s | fzf --prompt='Open File> ' --height=40%% --reverse "
+                     "< /dev/tty > \"%s\" 2> /dev/tty",
+                     cwd, find_cmd, tmp_template);
+        }
+    } else {
+        const char *find_cmd = "find . -type f 2>/dev/null";
+        
+        if (have_nfzf) {
+            snprintf(cmd, sizeof(cmd),
+                     "cd '%s' && %s | nfzf > \"%s\" 2>/dev/null",
+                     cwd, find_cmd, tmp_template);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                     "cd '%s' && %s | fzf --prompt='Open File> ' --height=40%% --reverse "
+                     "< /dev/tty > \"%s\" 2> /dev/tty",
+                     cwd, find_cmd, tmp_template);
+        }
+    }
+
+    def_prog_mode();
+    endwin();
+    int rc = system(cmd);
+    reset_prog_mode();
+    refresh();
+
+    if (rc != 0) {
+        unlink(tmp_template);
+        return 0;
+    }
+
+    FILE *f = fopen(tmp_template, "r");
+    if (!f) {
+        unlink(tmp_template);
+        return 0;
+    }
+
+    char buf[1024] = {0};
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        unlink(tmp_template);
+        return 0;
+    }
+    fclose(f);
+    unlink(tmp_template);
+
+    trim_newlines(buf);
+    if (buf[0] == '\0') return 0;
+
+    strncpy(out, buf, out_len - 1);
+    out[out_len - 1] = '\0';
+    return 1;
+}
 static int load_command(Buffer *buf, const char *label, const char *cmd, Language lang) {
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
@@ -885,14 +1000,14 @@ static int is_pdf_url(const char *url) {
     if (!url) return 0;
     int len = strlen(url);
     if (len < 4) return 0;
-    
+
     // Check for .pdf extension (case insensitive)
     const char *ext = url + len - 4;
     if (strcasecmp(ext, ".pdf") == 0) return 1;
-    
+
     // Also check if there's .pdf followed by query params
     if (strstr(url, ".pdf?") || strstr(url, ".PDF?")) return 1;
-    
+
     return 0;
 }
 
@@ -926,18 +1041,18 @@ int load_wget_response(Buffer *buf, const char *url) {
 
     // Build wget command with PDF support
     char cmd[2048];
-    
+
     // Check if URL points to a PDF
     int have_pdftotext = cmd_exists("pdftotext");
     if (is_pdf_url(url) && have_pdftotext) {
         // Download PDF and convert to text
-        snprintf(cmd, sizeof(cmd), 
+        snprintf(cmd, sizeof(cmd),
                  "wget -qO- '%s' 2>/dev/null | pdftotext -layout - - 2>&1 || "
-                 "echo 'Failed to fetch or convert PDF'", 
+                 "echo 'Failed to fetch or convert PDF'",
                  url);
     } else if (is_pdf_url(url) && !have_pdftotext) {
         // Can't convert, show error
-        snprintf(cmd, sizeof(cmd), 
+        snprintf(cmd, sizeof(cmd),
                  "echo 'Error: PDF detected but pdftotext not found. Install poppler-utils.'");
     } else {
         // Regular wget
@@ -999,18 +1114,18 @@ int load_w3m_response(Buffer *buf, const char *url) {
 
     // Build w3m command with PDF support
     char cmd[2048];
-    
+
     // Check if URL points to a PDF
     int have_pdftotext = cmd_exists("pdftotext");
     if (is_pdf_url(url) && have_pdftotext) {
         // Download PDF and convert to text (using wget since w3m won't help with binary)
-        snprintf(cmd, sizeof(cmd), 
+        snprintf(cmd, sizeof(cmd),
                  "wget -qO- '%s' 2>/dev/null | pdftotext -layout - - 2>&1 || "
-                 "echo 'Failed to fetch or convert PDF'", 
+                 "echo 'Failed to fetch or convert PDF'",
                  url);
     } else if (is_pdf_url(url) && !have_pdftotext) {
         // Can't convert, show error
-        snprintf(cmd, sizeof(cmd), 
+        snprintf(cmd, sizeof(cmd),
                  "echo 'Error: PDF detected but pdftotext not found. Install poppler-utils.'");
     } else {
         // Regular w3m
@@ -1997,7 +2112,7 @@ void draw_buffer(ViewerState *state) {
     if (state->wrap_enabled) {
         // WRAPPING MODE - ignore horizontal scroll, reset it
         state->horiz_scroll_offset = 0;
-        
+
         int y = content_start_y;
         int logical_line = buf->scroll_offset;
 
@@ -2063,14 +2178,14 @@ void draw_buffer(ViewerState *state) {
             // NEW: Apply horizontal scrolling
             const char *line = buf->lines[line_idx];
             int line_len = strlen(line);
-            
+
             // Skip characters based on horizontal scroll offset
             int start_col = state->horiz_scroll_offset;
             if (start_col >= line_len) {
                 // Scrolled past end of line, show nothing
                 continue;
             }
-            
+
             // Create a substring starting from the horizontal offset
             char visible_line[MAX_LINE_LEN];
             strncpy(visible_line, line + start_col, sizeof(visible_line) - 1);
@@ -2090,12 +2205,15 @@ void draw_ui(ViewerState *state) {
     refresh();
 }
 static void cmd_show_help(void) {
-    if (system("command -v fzf >/dev/null 2>&1") != 0) {
+    int have_nfzf = check_command_exists("nfzf");
+    int have_fzf  = check_command_exists("fzf");
+    
+    if (!have_nfzf && !have_fzf) {
         int max_y = getmaxy(stdscr);
         int max_x = getmaxx(stdscr);
         attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         mvhline(max_y - 2, 0, ' ', max_x);
-        mvprintw(max_y - 2, 1, "fzf is required for the help menu");
+        mvprintw(max_y - 2, 1, "fzf or nfzf is required for the help menu");
         attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         refresh();
         napms(1500);
@@ -2117,6 +2235,10 @@ static void cmd_show_help(void) {
     fprintf(help_file, "=== NAVIGATION ===\n");
     fprintf(help_file, "j / DOWN        | Scroll down one line\n");
     fprintf(help_file, "k / UP          | Scroll up one line\n");
+    fprintf(help_file, "h / LEFT        | Scroll left (when wrap OFF)\n");
+    fprintf(help_file, "l / RIGHT       | Scroll right (when wrap OFF)\n");
+    fprintf(help_file, "0               | Jump to column 0 (when wrap OFF)\n");
+    fprintf(help_file, "$               | Jump to end of line (when wrap OFF)\n");
     fprintf(help_file, "d / Ctrl+D      | Half page down\n");
     fprintf(help_file, "u / Ctrl+U      | Half page up\n");
     fprintf(help_file, "g               | Jump to top\n");
@@ -2133,7 +2255,7 @@ static void cmd_show_help(void) {
     fprintf(help_file, "Tab             | Next buffer\n");
     fprintf(help_file, "Shift+Tab       | Previous buffer\n");
     fprintf(help_file, "x               | Close current buffer\n");
-    fprintf(help_file, "o               | Open file with fzf picker\n");
+    fprintf(help_file, "o               | Open file with fuzzy picker\n");
     fprintf(help_file, "\n");
 
     fprintf(help_file, "=== HTTP & NETWORK ===\n");
@@ -2157,8 +2279,8 @@ static void cmd_show_help(void) {
     fprintf(help_file, "\n");
 
     fprintf(help_file, "=== SETTINGS ===\n");
-    fprintf(help_file, "l / L           | Toggle line numbers\n");
-    fprintf(help_file, "t / T           | Toggle line wrapping\n");
+    fprintf(help_file, "L               | Toggle line numbers\n");
+    fprintf(help_file, "T               | Toggle line wrapping\n");
     fprintf(help_file, "\n");
 
     fprintf(help_file, "=== OTHER ===\n");
@@ -2169,14 +2291,22 @@ static void cmd_show_help(void) {
     fclose(help_file);
 
     char cmd[8192];
-    snprintf(cmd, sizeof(cmd),
-        "fzf --height=100%% --layout=reverse --border "
-        "--header='Peek Help - Search commands (ESC to close)' "
-        "< \"%s\" > /dev/null 2> /dev/tty",
-        help_template);
+    if (have_nfzf) {
+        snprintf(cmd, sizeof(cmd),
+                 "nfzf < \"%s\" > /dev/null 2>/dev/null",
+                 help_template);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "fzf --height=100%% --layout=reverse --border "
+                 "--header='Peek Help - Search commands (ESC to close)' "
+                 "< \"%s\" > /dev/null 2> /dev/tty",
+                 help_template);
+    }
 
+    def_prog_mode();
     endwin();
     system(cmd);
+    reset_prog_mode();
     refresh();
     clear();
 
@@ -2329,37 +2459,36 @@ void handle_input(ViewerState *state, int *running) {
         case 'o':
         case 'O':
             if (!state->copy_mode) {
-                endwin();
-
-                char cwd[1024];
-                if (!getcwd(cwd, sizeof(cwd))) break;
-
-                char cmd[2048];
-                snprintf(cmd, sizeof(cmd),
-                         "find '%s' -type f 2>/dev/null | "
-                         "fzf --prompt='Open File> ' --height=40%% --reverse",
-                         cwd);
-
-                FILE *p = popen(cmd, "r");
-                if (p) {
-                    char filepath[1024] = {0};
-                    if (fgets(filepath, sizeof(filepath), p)) {
-                        filepath[strcspn(filepath, "\r\n")] = '\0';
-                        if (filepath[0] != '\0' && state->buffer_count < MAX_BUFFERS) {
-                            if (load_file(&state->buffers[state->buffer_count], filepath) == 0) {
-                                state->current_buffer = state->buffer_count;
-                                state->buffer_count++;
-                            }
+                char filepath[1024] = {0};
+                
+                if (pick_file_for_peek(filepath, sizeof(filepath))) {
+                    // Strip leading ./ if present
+                    const char *clean_path = filepath;
+                    if (filepath[0] == '.' && filepath[1] == '/') {
+                        clean_path = filepath + 2;
+                    }
+                    
+                    if (state->buffer_count < MAX_BUFFERS) {
+                        if (load_file(&state->buffers[state->buffer_count], clean_path) == 0) {
+                            state->current_buffer = state->buffer_count;
+                            state->buffer_count++;
+                        } else {
+                            // Show error
+                            int max_y = getmaxy(stdscr);
+                            int max_x = getmaxx(stdscr);
+                            attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+                            mvhline(max_y - 2, 0, ' ', max_x);
+                            mvprintw(max_y - 2, 1, "Failed to load file: %s", clean_path);
+                            attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+                            refresh();
+                            napms(1500);
                         }
                     }
-                    pclose(p);
                 }
-
-                refresh();
+                
                 clear();
             }
             break;
-
         case 'j':
         case KEY_DOWN:
             if (buf->scroll_offset < buf->line_count - 1) {
@@ -2432,7 +2561,7 @@ int main(int argc, char *argv[]) {
     state->wrap_enabled = 1;
     state->copy_mode = 0;
     state->horiz_scroll_offset = 0;
-    state->horiz_scroll_step = 8; 
+    state->horiz_scroll_step = 8;
 
     int stdin_is_pipe = !isatty(STDIN_FILENO);
     int loaded_anything = 0;
