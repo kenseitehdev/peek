@@ -66,6 +66,8 @@ typedef struct {
     int copy_mode;
     int copy_start_line;
     int copy_end_line;
+    int horiz_scroll_offset;    // Horizontal scroll position
+    int horiz_scroll_step;   
 } ViewerState;
 
 // Color pairs
@@ -80,7 +82,7 @@ typedef struct {
 #define COLOR_STATUS 9
 #define COLOR_LINENR 10
 #define COLOR_COPY_SELECT 11
-
+ static int is_pdf_file(const char *filepath);
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
@@ -102,6 +104,8 @@ static void usage(const char *prog) {
         "\n"
         "Keybindings:\n"
         "  j/k           Scroll down/up\n"
+        "  h/l           Scroll left/right (when wrap is OFF)\n"
+        "  0/$           Jump to start/end of line (when wrap is OFF)\n"
         "  g/G           Go to top/bottom\n"
         "  d/u           Half-page down/up\n"
         "  /             Search\n"
@@ -110,7 +114,7 @@ static void usage(const char *prog) {
         "  R             Reload current HTTP buffer\n"
         "  w             Fetch URL with wget (opens popup)\n"
         "  W             Fetch URL with w3m -dump (opens popup)\n"
-        "  f             Fetch RSS/Atom feed (opens popup)\n" 
+        "  f             Fetch RSS/Atom feed (opens popup)\n"
         "  s             SQL query (opens popup)\n"
         "  x             Close current buffer\n"
         "  o             Open file with fzf\n"
@@ -124,7 +128,6 @@ static void usage(const char *prog) {
         prog, prog, prog, prog, prog, prog, prog, prog
     );
 }
-
 static int starts_with(const char *s, const char *prefix) {
     size_t n = strlen(prefix);
     return strncmp(s, prefix, n) == 0;
@@ -599,6 +602,48 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
 // --- Loaders ----------------------------------------------------------------
 
 int load_file(Buffer *buf, const char *filepath) {
+    // First check if this is a PDF file BEFORE opening
+    if (is_pdf_file(filepath)) {
+        int have_pdftotext = cmd_exists("pdftotext");
+        if (have_pdftotext) {
+            buf->line_count = 0;
+            buf->scroll_offset = 0;
+            strncpy(buf->filepath, filepath, sizeof(buf->filepath) - 1);
+            buf->filepath[sizeof(buf->filepath) - 1] = '\0';
+            buf->lang = LANG_NONE;
+            buf->is_active = 1;
+            buf->is_http_buffer = 0;
+            buf->http_request[0] = '\0';
+            
+            char cmd[2048];
+            snprintf(cmd, sizeof(cmd), "pdftotext -layout '%s' - 2>/dev/null", filepath);
+            
+            FILE *p = popen(cmd, "r");
+            if (!p) return -1;
+            
+            char line[MAX_LINE_LEN];
+            while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
+                size_t len = strlen(line);
+                while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+                
+                strip_overstrikes(line);
+                strip_ansi(line);
+                rtrim(line);
+                
+                buf->lines[buf->line_count++] = strdup(line);
+            }
+            
+            int rc = pclose(p);
+            (void)rc;
+            
+            return (buf->line_count > 0) ? 0 : -1;
+        } else {
+            fprintf(stderr, "Warning: pdftotext not found. Install poppler-utils to view PDFs.\n");
+            return -1;
+        }
+    }
+    
+    // Regular file handling
     FILE *f = fopen(filepath, "r");
     if (!f) return -1;
 
@@ -623,7 +668,6 @@ int load_file(Buffer *buf, const char *filepath) {
     fclose(f);
     return 0;
 }
-
 int load_stdin(Buffer *buf) {
     buf->line_count = 0;
     buf->scroll_offset = 0;
@@ -781,7 +825,7 @@ int load_rss_feed(Buffer *buf, const char *url) {
     // This fetches the feed, formats the XML, then extracts key fields
     char cmd[4096];
     int have_xmllint = cmd_exists("xmllint");
-    
+
     if (have_xmllint) {
         snprintf(cmd, sizeof(cmd),
                  "curl -sL '%s' 2>&1 | xmllint --format - 2>/dev/null | "
@@ -837,6 +881,31 @@ int load_rss_feed(Buffer *buf, const char *url) {
     return (buf->line_count > 0) ? 0 : -1;
 }
 // --- wget support -----------------------------------------------------------
+static int is_pdf_url(const char *url) {
+    if (!url) return 0;
+    int len = strlen(url);
+    if (len < 4) return 0;
+    
+    // Check for .pdf extension (case insensitive)
+    const char *ext = url + len - 4;
+    if (strcasecmp(ext, ".pdf") == 0) return 1;
+    
+    // Also check if there's .pdf followed by query params
+    if (strstr(url, ".pdf?") || strstr(url, ".PDF?")) return 1;
+    
+    return 0;
+}
+
+static int is_pdf_file(const char *filepath) {
+    if (!filepath) return 0;
+    const char *ext = strrchr(filepath, '.');
+    if (!ext) return 0;
+    return (strcasecmp(ext, ".pdf") == 0);
+}
+
+// ============================================================================
+// Modified load_wget_response() - handles PDF URLs
+// ============================================================================
 
 int load_wget_response(Buffer *buf, const char *url) {
     // Free existing buffer content
@@ -855,13 +924,33 @@ int load_wget_response(Buffer *buf, const char *url) {
     strncpy(buf->http_request, url, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
 
-    // Build wget command
+    // Build wget command with PDF support
     char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "wget -qO- '%s' 2>&1", url);
+    
+    // Check if URL points to a PDF
+    int have_pdftotext = cmd_exists("pdftotext");
+    if (is_pdf_url(url) && have_pdftotext) {
+        // Download PDF and convert to text
+        snprintf(cmd, sizeof(cmd), 
+                 "wget -qO- '%s' 2>/dev/null | pdftotext -layout - - 2>&1 || "
+                 "echo 'Failed to fetch or convert PDF'", 
+                 url);
+    } else if (is_pdf_url(url) && !have_pdftotext) {
+        // Can't convert, show error
+        snprintf(cmd, sizeof(cmd), 
+                 "echo 'Error: PDF detected but pdftotext not found. Install poppler-utils.'");
+    } else {
+        // Regular wget
+        snprintf(cmd, sizeof(cmd), "wget -qO- '%s' 2>&1", url);
+    }
 
     // Create a label for the buffer
     char label[256];
-    snprintf(label, sizeof(label), "[wget: %s]", url);
+    if (is_pdf_url(url)) {
+        snprintf(label, sizeof(label), "[wget-PDF: %s]", url);
+    } else {
+        snprintf(label, sizeof(label), "[wget: %s]", url);
+    }
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
 
@@ -887,7 +976,9 @@ int load_wget_response(Buffer *buf, const char *url) {
     return (buf->line_count > 0) ? 0 : -1;
 }
 
-// --- w3m -dump support ------------------------------------------------------
+// ============================================================================
+// Modified load_w3m_response() - handles PDF URLs
+// ============================================================================
 
 int load_w3m_response(Buffer *buf, const char *url) {
     // Free existing buffer content
@@ -906,13 +997,33 @@ int load_w3m_response(Buffer *buf, const char *url) {
     strncpy(buf->http_request, url, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
 
-    // Build w3m command
+    // Build w3m command with PDF support
     char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "w3m -dump '%s' 2>&1", url);
+    
+    // Check if URL points to a PDF
+    int have_pdftotext = cmd_exists("pdftotext");
+    if (is_pdf_url(url) && have_pdftotext) {
+        // Download PDF and convert to text (using wget since w3m won't help with binary)
+        snprintf(cmd, sizeof(cmd), 
+                 "wget -qO- '%s' 2>/dev/null | pdftotext -layout - - 2>&1 || "
+                 "echo 'Failed to fetch or convert PDF'", 
+                 url);
+    } else if (is_pdf_url(url) && !have_pdftotext) {
+        // Can't convert, show error
+        snprintf(cmd, sizeof(cmd), 
+                 "echo 'Error: PDF detected but pdftotext not found. Install poppler-utils.'");
+    } else {
+        // Regular w3m
+        snprintf(cmd, sizeof(cmd), "w3m -dump '%s' 2>&1", url);
+    }
 
     // Create a label for the buffer
     char label[256];
-    snprintf(label, sizeof(label), "[w3m: %s]", url);
+    if (is_pdf_url(url)) {
+        snprintf(label, sizeof(label), "[w3m-PDF: %s]", url);
+    } else {
+        snprintf(label, sizeof(label), "[w3m: %s]", url);
+    }
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
 
@@ -937,7 +1048,6 @@ int load_w3m_response(Buffer *buf, const char *url) {
 
     return (buf->line_count > 0) ? 0 : -1;
 }
-
 // --- SQL Database Support ---------------------------------------------------
 
 int load_sql_response(Buffer *buf, const char *db_type, const char *connection, const char *query) {
@@ -1843,12 +1953,23 @@ void draw_status_bar(ViewerState *state) {
     const char *mode = state->copy_mode ? "VISUAL" : "NORMAL";
 
     char left[512];
-    snprintf(left, sizeof(left), "NBL Peek | %s | %s | %d%% | %d/%d lines | L:%s W:%s%s",
-             mode, name, percent,
-             buf->scroll_offset + 1, buf->line_count,
-             state->show_line_numbers ? "ON" : "OFF",
-             state->wrap_enabled ? "ON" : "OFF",
-             buf->is_http_buffer ? " | HTTP" : "");
+    // ADD horizontal scroll position to status (HScroll:X)
+    if (state->wrap_enabled) {
+        snprintf(left, sizeof(left), "NBL Peek | %s | %s | %d%% | %d/%d lines | L:%s W:%s%s",
+                 mode, name, percent,
+                 buf->scroll_offset + 1, buf->line_count,
+                 state->show_line_numbers ? "ON" : "OFF",
+                 state->wrap_enabled ? "ON" : "OFF",
+                 buf->is_http_buffer ? " | HTTP" : "");
+    } else {
+        snprintf(left, sizeof(left), "NBL Peek | %s | %s | %d%% | %d/%d lines | L:%s W:%s | HScroll:%d%s",
+                 mode, name, percent,
+                 buf->scroll_offset + 1, buf->line_count,
+                 state->show_line_numbers ? "ON" : "OFF",
+                 state->wrap_enabled ? "ON" : "OFF",
+                 state->horiz_scroll_offset,
+                 buf->is_http_buffer ? " | HTTP" : "");
+    }
 
     mvprintw(max_y - 1, 1, "%s", left);
 
@@ -1864,7 +1985,6 @@ void draw_status_bar(ViewerState *state) {
     attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
 }
 
-
 void draw_buffer(ViewerState *state) {
     Buffer *buf = &state->buffers[state->current_buffer];
     int max_y = getmaxy(stdscr);
@@ -1875,6 +1995,9 @@ void draw_buffer(ViewerState *state) {
     int line_nr_width = state->show_line_numbers ? 6 : 0;
 
     if (state->wrap_enabled) {
+        // WRAPPING MODE - ignore horizontal scroll, reset it
+        state->horiz_scroll_offset = 0;
+        
         int y = content_start_y;
         int logical_line = buf->scroll_offset;
 
@@ -1916,6 +2039,7 @@ void draw_buffer(ViewerState *state) {
         while (y < content_start_y + content_height) mvhline(y++, 0, ' ', max_x);
 
     } else {
+        // NO WRAPPING MODE - apply horizontal scrolling
         for (int i = 0; i < content_height; i++) {
             int line_idx = buf->scroll_offset + i;
             int y = content_start_y + i;
@@ -1936,13 +2060,28 @@ void draw_buffer(ViewerState *state) {
 
             int in_selection = state->copy_mode && line_idx >= lo && line_idx <= hi;
 
+            // NEW: Apply horizontal scrolling
+            const char *line = buf->lines[line_idx];
+            int line_len = strlen(line);
+            
+            // Skip characters based on horizontal scroll offset
+            int start_col = state->horiz_scroll_offset;
+            if (start_col >= line_len) {
+                // Scrolled past end of line, show nothing
+                continue;
+            }
+            
+            // Create a substring starting from the horizontal offset
+            char visible_line[MAX_LINE_LEN];
+            strncpy(visible_line, line + start_col, sizeof(visible_line) - 1);
+            visible_line[sizeof(visible_line) - 1] = '\0';
+
             if (in_selection) attron(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
-            highlight_line(buf->lines[line_idx], buf->lang, y, line_nr_width + 1, max_x);
+            highlight_line(visible_line, buf->lang, y, line_nr_width + 1, max_x);
             if (in_selection) attroff(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
         }
     }
 }
-
 void draw_ui(ViewerState *state) {
     clear();
     draw_tabbar(state);
@@ -2002,7 +2141,7 @@ static void cmd_show_help(void) {
     fprintf(help_file, "R               | Reload current HTTP buffer\n");
     fprintf(help_file, "w               | Fetch URL with wget\n");
     fprintf(help_file, "W               | Fetch URL with w3m -dump\n");
-    fprintf(help_file, "f               | Fetch RSS/Atom feed\n"); 
+    fprintf(help_file, "f               | Fetch RSS/Atom feed\n");
     fprintf(help_file, "\n");
 
     fprintf(help_file, "=== SQL DATABASE ===\n");
@@ -2044,6 +2183,7 @@ static void cmd_show_help(void) {
     unlink(help_template);
 }
 // --- Input ------------------------------------------------------------------
+// Complete handle_input() function with horizontal scrolling support
 
 void handle_input(ViewerState *state, int *running) {
     int ch = getch();
@@ -2054,8 +2194,9 @@ void handle_input(ViewerState *state, int *running) {
 
     switch (ch) {
         case '?':
-    if (!state->copy_mode) cmd_show_help();
-    break;
+            if (!state->copy_mode) cmd_show_help();
+            break;
+
         case 's':
         case 'S':
             if (!state->copy_mode) prompt_sql_query(state);
@@ -2077,10 +2218,12 @@ void handle_input(ViewerState *state, int *running) {
         case 'R':
             if (!state->copy_mode) reload_http_buffer(state);
             break;
+
         case 'f':
         case 'F':
             if (!state->copy_mode) prompt_url(state, "RSS", load_rss_feed);
             break;
+
         case 'w':
             if (!state->copy_mode) prompt_url(state, "wget", load_wget_response);
             break;
@@ -2109,14 +2252,66 @@ void handle_input(ViewerState *state, int *running) {
             }
             break;
 
+        // HORIZONTAL SCROLLING - only when wrap is OFF and not in copy mode
+        case 'h':
+        case KEY_LEFT:
+            if (!state->wrap_enabled && !state->copy_mode) {
+                // Scroll left
+                state->horiz_scroll_offset -= state->horiz_scroll_step;
+                if (state->horiz_scroll_offset < 0) {
+                    state->horiz_scroll_offset = 0;
+                }
+            }
+            break;
+
         case 'l':
+        case KEY_RIGHT:
+            if (!state->wrap_enabled && !state->copy_mode) {
+                // Scroll right
+                state->horiz_scroll_offset += state->horiz_scroll_step;
+                // Note: no max limit, user can scroll as far as they want
+            }
+            break;
+
+        case '0':  // Home - jump to column 0
+            if (!state->wrap_enabled && !state->copy_mode) {
+                state->horiz_scroll_offset = 0;
+            }
+            break;
+
+        case '$':  // End - jump to see end of longest line
+            if (!state->wrap_enabled && !state->copy_mode) {
+                // Find longest line in visible area
+                int max_len = 0;
+                for (int i = buf->scroll_offset; i < buf->scroll_offset + visible_lines && i < buf->line_count; i++) {
+                    int len = strlen(buf->lines[i]);
+                    if (len > max_len) max_len = len;
+                }
+                int max_x = getmaxx(stdscr);
+                int line_nr_width = state->show_line_numbers ? 6 : 0;
+                int visible_width = max_x - line_nr_width - 1;
+
+                // Scroll to show the end
+                state->horiz_scroll_offset = max_len - visible_width;
+                if (state->horiz_scroll_offset < 0) {
+                    state->horiz_scroll_offset = 0;
+                }
+            }
+            break;
+
+        // LINE NUMBERS - Changed to uppercase L only (lowercase l is now right-scroll)
         case 'L':
             state->show_line_numbers = !state->show_line_numbers;
             break;
 
+        // WRAP TOGGLE - Reset horizontal scroll when enabling wrap
         case 't':
         case 'T':
             state->wrap_enabled = !state->wrap_enabled;
+            // When toggling wrap on, reset horizontal scroll
+            if (state->wrap_enabled) {
+                state->horiz_scroll_offset = 0;
+            }
             break;
 
         case '/':
@@ -2236,6 +2431,8 @@ int main(int argc, char *argv[]) {
     state->show_line_numbers = 1;
     state->wrap_enabled = 1;
     state->copy_mode = 0;
+    state->horiz_scroll_offset = 0;
+    state->horiz_scroll_step = 8; 
 
     int stdin_is_pipe = !isatty(STDIN_FILENO);
     int loaded_anything = 0;
