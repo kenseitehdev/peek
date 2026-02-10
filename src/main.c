@@ -1,88 +1,5 @@
 // peek.c
-// A tiny ncurses pager with multi-buffer, search, wrap toggle, line numbers, copy-mode,
-// HTTP request support, wget, w3m -dump, SQL query support, and extended language highlighting.
-#define _POSIX_C_SOURCE 200809L
-#include <ncurses.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-#include <ctype.h>
-#include <locale.h>
-#include <unistd.h>
-#include <errno.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <strings.h>
-#define MAX_BUFFERS 50
-#define MAX_LINES 10000
-#define MAX_LINE_LEN 2048
-
-typedef enum {
-    LANG_NONE = 0,
-    LANG_C,
-    LANG_CPP,
-    LANG_PYTHON,
-    LANG_JAVA,
-    LANG_JS,
-    LANG_TS,
-    LANG_HTML,
-    LANG_CSS,
-    LANG_SHELL,
-    LANG_MARKDOWN,
-    LANG_MAN,
-    LANG_RUST,
-    LANG_GO,
-    LANG_RUBY,
-    LANG_PHP,
-    LANG_SQL,
-    LANG_JSON,
-    LANG_XML,
-    LANG_YAML
-} Language;
-
-typedef struct {
-    char *lines[MAX_LINES];
-    int line_count;
-    char filepath[1024];
-    char http_request[512];  // Store the HTTP request command if this is an HTTP buffer
-    Language lang;
-    int scroll_offset;
-    int is_active;
-    int is_http_buffer;      // Flag to indicate this is an HTTP response buffer
-} Buffer;
-
-typedef struct {
-    Buffer buffers[MAX_BUFFERS];
-    int buffer_count;
-    int current_buffer;
-    char search_term[256];
-    int search_line;
-    int search_match_count;
-    int current_match;
-    int show_line_numbers;
-    int wrap_enabled;
-
-    // Copy/visual
-    int copy_mode;
-    int copy_start_line;
-    int copy_end_line;
-    int horiz_scroll_offset;    // Horizontal scroll position
-    int horiz_scroll_step;
-} ViewerState;
-
-// Color pairs
-#define COLOR_NORMAL 1
-#define COLOR_KEYWORD 2
-#define COLOR_STRING 3
-#define COLOR_COMMENT 4
-#define COLOR_NUMBER 5
-#define COLOR_TYPE 6
-#define COLOR_FUNCTION 7
-#define COLOR_TABBAR 8
-#define COLOR_STATUS 9
-#define COLOR_LINENR 10
-#define COLOR_COPY_SELECT 11
- static int is_pdf_file(const char *filepath);
+#include "../include/peek.h"
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
@@ -713,23 +630,23 @@ static int pick_file_for_peek(char *out, size_t out_len) {
         // Manual fallback
         def_prog_mode();
         endwin();
-        
+
         char input[1024] = {0};
         printf("\nEnter file path to open: ");
         fflush(stdout);
-        
+
         if (!fgets(input, sizeof(input), stdin)) {
             reset_prog_mode();
             refresh();
             return 0;
         }
-        
+
         reset_prog_mode();
         refresh();
-        
+
         trim_newlines(input);
         if (input[0] == '\0') return 0;
-        
+
         strncpy(out, input, out_len - 1);
         out[out_len - 1] = '\0';
         return 1;
@@ -745,11 +662,11 @@ static int pick_file_for_peek(char *out, size_t out_len) {
 
     int has_fd = check_command_exists("fd");
     char cmd[8192];
-    
+
     if (has_fd) {
         const char *find_cmd = "fd -L -t f . --exclude .git --exclude node_modules "
                                "--exclude build --exclude dist --exclude .cache 2>/dev/null";
-        
+
         if (have_nfzf) {
             snprintf(cmd, sizeof(cmd),
                      "cd '%s' && %s | nfzf > \"%s\" 2>/dev/null",
@@ -762,7 +679,7 @@ static int pick_file_for_peek(char *out, size_t out_len) {
         }
     } else {
         const char *find_cmd = "find . -type f 2>/dev/null";
-        
+
         if (have_nfzf) {
             snprintf(cmd, sizeof(cmd),
                      "cd '%s' && %s | nfzf > \"%s\" 2>/dev/null",
@@ -2207,7 +2124,7 @@ void draw_ui(ViewerState *state) {
 static void cmd_show_help(void) {
     int have_nfzf = check_command_exists("nfzf");
     int have_fzf  = check_command_exists("fzf");
-    
+
     if (!have_nfzf && !have_fzf) {
         int max_y = getmaxy(stdscr);
         int max_x = getmaxx(stdscr);
@@ -2460,14 +2377,14 @@ void handle_input(ViewerState *state, int *running) {
         case 'O':
             if (!state->copy_mode) {
                 char filepath[1024] = {0};
-                
+
                 if (pick_file_for_peek(filepath, sizeof(filepath))) {
                     // Strip leading ./ if present
                     const char *clean_path = filepath;
                     if (filepath[0] == '.' && filepath[1] == '/') {
                         clean_path = filepath + 2;
                     }
-                    
+
                     if (state->buffer_count < MAX_BUFFERS) {
                         if (load_file(&state->buffers[state->buffer_count], clean_path) == 0) {
                             state->current_buffer = state->buffer_count;
@@ -2485,7 +2402,7 @@ void handle_input(ViewerState *state, int *running) {
                         }
                     }
                 }
-                
+
                 clear();
             }
             break;
