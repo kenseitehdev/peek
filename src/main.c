@@ -58,7 +58,6 @@ static int is_man_command_arg(const char *arg) {
     if (!arg || !*arg) return 0;
     if (starts_with(arg, "man ")) return 1;
 
-    // crude: if it contains "man " anywhere
     if (contains_substr(arg, "man ")) {
         const char *p = strstr(arg, "man ");
         return (p && p[4] != '\0');
@@ -70,11 +69,9 @@ static int cmd_exists(const char *name) {
     if (!name || !*name) return 0;
     const char *path = getenv("PATH");
     if (!path) return 0;
-
     char buf[4096];
     strncpy(buf, path, sizeof(buf)-1);
     buf[sizeof(buf)-1] = '\0';
-
     char *save = NULL;
     for (char *dir = strtok_r(buf, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
         char full[4096];
@@ -86,7 +83,6 @@ static int cmd_exists(const char *name) {
 
 // --- Cleanup helpers ---------------------------------------------------------
 
-// Strip classic man overstrikes (bold/underline via backspace patterns)
 static void trim_newlines(char *s) {
     if (!s) return;
     size_t len = strlen(s);
@@ -112,24 +108,23 @@ static void strip_overstrikes(char *s) {
     *dst = '\0';
 }
 
-// Strip ANSI/VT escape sequences (colors, cursor moves, etc.)
 static void strip_ansi(char *s) {
     char *d = s;
     for (char *p = s; *p; ) {
-        if ((unsigned char)*p == 0x1B) { // ESC
+        if ((unsigned char)*p == 0x1B) { 
             p++;
-            if (*p == '[') { // CSI
+            if (*p == '[') { 
                 p++;
                 while (*p && !(*p >= '@' && *p <= '~')) p++;
                 if (*p) p++;
                 continue;
-            } else if (*p == ']') { // OSC ... BEL
+            } else if (*p == ']') {
                 p++;
                 while (*p && (unsigned char)*p != 0x07) p++;
                 if (*p) p++;
                 continue;
             } else {
-                if (*p) p++; // other ESC X
+                if (*p) p++; 
                 continue;
             }
         }
@@ -138,7 +133,6 @@ static void strip_ansi(char *s) {
     *d = '\0';
 }
 
-// Trim trailing whitespace (useful for man output)
 static void rtrim(char *s) {
     int n = (int)strlen(s);
     while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t')) s[--n] = '\0';
@@ -283,7 +277,6 @@ int is_sql_keyword(const char *word) {
 
 // --- MAN "syntax highlighting" ----------------------------------------------
 
-// "SECTION" headers in rendered man pages are usually all caps words on a line.
 static int is_man_section_header(const char *s) {
     int letters = 0;
     for (; *s; s++) {
@@ -295,7 +288,6 @@ static int is_man_section_header(const char *s) {
     return letters >= 3;
 }
 
-// Helper: highlight a token region [i, j)
 static void draw_tok(int y, int x, const char *s, int i, int j, int max_x, int pair, int bold) {
     if (x >= max_x) return;
     if (bold) attron(COLOR_PAIR(pair) | A_BOLD);
@@ -358,13 +350,9 @@ void free_wrapped_line(WrappedLine *wl) {
 
 void highlight_line(const char *line, Language lang, int y, int start_x, int line_width) {
     if (!line) return;
-
-    // MAN highlighting (rendered man text)
     if (lang == LANG_MAN) {
         const char *p = line;
         while (*p == ' ') p++;
-
-        // Section headers (NAME, SYNOPSIS, DESCRIPTION, OPTIONS, etc.)
         if (is_man_section_header(p)) {
             attron(COLOR_PAIR(COLOR_KEYWORD) | A_BOLD);
             mvaddnstr(y, start_x, line, line_width - start_x);
@@ -379,36 +367,30 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
         while (i < len && x < line_width) {
             unsigned char ch = (unsigned char)line[i];
 
-            // whitespace
             if (isspace(ch)) {
                 mvaddch(y, x++, line[i++]);
                 continue;
             }
 
-            // options like -a, -rf, --color=auto
             if (line[i] == '-') {
                 int j = i;
                 while (j < len && !isspace((unsigned char)line[j])) j++;
 
-                // highlight option flags
                 draw_tok(y, x, line, i, j, line_width, COLOR_NUMBER, 1);
                 x += (j - i);
                 i = j;
                 continue;
             }
 
-            // function-ish tokens like printf(3), open(2), etc.
             if (isalpha((unsigned char)line[i]) || line[i] == '_') {
                 int j = i;
                 while (j < len && (isalnum((unsigned char)line[j]) || line[j] == '_' || line[j] == '-')) j++;
 
-                // check for "(digit)" right after
                 int k = j;
                 if (k + 2 < len && line[k] == '(' && isdigit((unsigned char)line[k+1])) {
                     int kk = k+2;
                     while (kk < len && isdigit((unsigned char)line[kk])) kk++;
                     if (kk < len && line[kk] == ')') {
-                        // highlight name as function/type and the section part too
                         draw_tok(y, x, line, i, j, line_width, COLOR_FUNCTION, 1);
                         x += (j - i);
                         draw_tok(y, x, line, k, kk+1, line_width, COLOR_TYPE, 0);
@@ -417,13 +399,10 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
                         continue;
                     }
                 }
-
-                // default: normal word
                 while (i < j && x < line_width) mvaddch(y, x++, line[i++]);
                 continue;
             }
 
-            // everything else
             mvaddch(y, x++, line[i++]);
         }
         return;
@@ -437,7 +416,6 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
     while (i < len && col < line_width) {
         char ch = line[i];
 
-        // C-style comments
         if ((lang == LANG_C || lang == LANG_CPP || lang == LANG_JAVA || lang == LANG_JS ||
              lang == LANG_TS || lang == LANG_CSS || lang == LANG_RUST || lang == LANG_GO || lang == LANG_PHP) &&
             i + 1 < len && line[i] == '/' && line[i+1] == '/') {
@@ -448,7 +426,6 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             break;
         }
 
-        // Hash comments
         if ((lang == LANG_PYTHON || lang == LANG_SHELL || lang == LANG_RUBY ||
              lang == LANG_YAML || lang == LANG_PHP) && ch == '#') {
             attron(COLOR_PAIR(COLOR_COMMENT));
@@ -458,7 +435,6 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             break;
         }
 
-        // SQL comments
         if (lang == LANG_SQL && i + 1 < len && line[i] == '-' && line[i+1] == '-') {
             attron(COLOR_PAIR(COLOR_COMMENT));
             int j = i;
@@ -467,7 +443,6 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             break;
         }
 
-        // String literals
         if (ch == '"' || ch == '\'') {
             char quote = ch;
             attron(COLOR_PAIR(COLOR_STRING));
@@ -482,8 +457,6 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             attroff(COLOR_PAIR(COLOR_STRING));
             continue;
         }
-
-        // Numbers
         if (isdigit((unsigned char)ch)) {
             attron(COLOR_PAIR(COLOR_NUMBER));
             while (i < len && col < line_width &&
@@ -497,7 +470,6 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             continue;
         }
 
-        // Keywords and identifiers
         if (isalpha((unsigned char)ch) || ch == '_') {
             char word[128] = {0};
             int w = 0;
@@ -532,7 +504,6 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
 // --- Loaders ----------------------------------------------------------------
 
 int load_file(Buffer *buf, const char *filepath) {
-    // First check if this is a PDF file BEFORE opening
     if (is_pdf_file(filepath)) {
         int have_pdftotext = cmd_exists("pdftotext");
         if (have_pdftotext) {
@@ -573,7 +544,6 @@ int load_file(Buffer *buf, const char *filepath) {
         }
     }
 
-    // Regular file handling
     FILE *f = fopen(filepath, "r");
     if (!f) return -1;
 
@@ -627,7 +597,6 @@ static int pick_file_for_peek(char *out, size_t out_len) {
     int have_fzf  = check_command_exists("fzf");
 
     if (!have_nfzf && !have_fzf) {
-        // Manual fallback
         def_prog_mode();
         endwin();
 
@@ -757,10 +726,7 @@ static int load_command(Buffer *buf, const char *label, const char *cmd, Languag
     return (buf->line_count > 0) ? 0 : -1;
 }
 
-// Wrap a detected "man foo" command so output is plain text (no ANSI pager junk).
 static void build_man_cmd_plain(char *out, size_t outsz, const char *man_cmd) {
-    // Force MANPAGER=cat, and if 'col' exists, pass through col -bx (optional).
-    // We still strip ANSI regardless, but this reduces environment-dependent surprises.
     int have_col = cmd_exists("col");
 
     if (have_col) {
@@ -782,7 +748,6 @@ void free_buffer(Buffer *buf) {
 // --- HTTP Request Functions -------------------------------------------------
 
 int load_http_response(Buffer *buf, const char *request_input) {
-    // Free existing buffer content
     for (int i = 0; i < buf->line_count; i++) {
         free(buf->lines[i]);
         buf->lines[i] = NULL;
@@ -794,26 +759,19 @@ int load_http_response(Buffer *buf, const char *request_input) {
     buf->is_http_buffer = 1;
     buf->lang = LANG_NONE;
 
-    // Store the request for reload functionality
     strncpy(buf->http_request, request_input, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
-
-    // Build the command: Use xh with pretty printing for both headers and body
-    // --print=hb shows headers and body, --pretty=format forces formatting
-    // Then try to format JSON with jq if present, otherwise show as-is
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
              "OUTPUT=$(xh --print=hb --pretty=format %s 2>&1); "
              "echo \"$OUTPUT\" | jq -C . 2>/dev/null || echo \"$OUTPUT\"",
              request_input);
 
-    // Create a label for the buffer
     char label[256];
     snprintf(label, sizeof(label), "[HTTP: %s]", request_input);
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
 
-    // Execute the command and capture output
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
 
@@ -837,7 +795,6 @@ int load_http_response(Buffer *buf, const char *request_input) {
 // --- RSS Feed Support -------------------------------------------------------
 
 int load_rss_feed(Buffer *buf, const char *url) {
-    // Free existing buffer content
     for (int i = 0; i < buf->line_count; i++) {
         free(buf->lines[i]);
         buf->lines[i] = NULL;
@@ -849,12 +806,9 @@ int load_rss_feed(Buffer *buf, const char *url) {
     buf->is_http_buffer = 1;
     buf->lang = LANG_NONE;
 
-    // Store the URL for reload functionality
     strncpy(buf->http_request, url, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
 
-    // Build RSS formatting command
-    // This fetches the feed, formats the XML, then extracts key fields
     char cmd[4096];
     int have_xmllint = cmd_exists("xmllint");
 
@@ -873,7 +827,6 @@ int load_rss_feed(Buffer *buf, const char *url) {
                  "}'",
                  url);
     } else {
-        // Fallback without xmllint - just basic formatting
         snprintf(cmd, sizeof(cmd),
                  "curl -sL '%s' 2>&1 | "
                  "sed 's/></>\\\n</g' | "
@@ -885,13 +838,11 @@ int load_rss_feed(Buffer *buf, const char *url) {
                  url);
     }
 
-    // Create a label for the buffer
     char label[256];
     snprintf(label, sizeof(label), "[RSS: %s]", url);
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
 
-    // Execute the command and capture output
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
 
@@ -918,11 +869,9 @@ static int is_pdf_url(const char *url) {
     int len = strlen(url);
     if (len < 4) return 0;
 
-    // Check for .pdf extension (case insensitive)
     const char *ext = url + len - 4;
     if (strcasecmp(ext, ".pdf") == 0) return 1;
 
-    // Also check if there's .pdf followed by query params
     if (strstr(url, ".pdf?") || strstr(url, ".PDF?")) return 1;
 
     return 0;
@@ -940,7 +889,6 @@ static int is_pdf_file(const char *filepath) {
 // ============================================================================
 
 int load_wget_response(Buffer *buf, const char *url) {
-    // Free existing buffer content
     for (int i = 0; i < buf->line_count; i++) {
         free(buf->lines[i]);
         buf->lines[i] = NULL;
@@ -951,32 +899,21 @@ int load_wget_response(Buffer *buf, const char *url) {
     buf->is_active = 1;
     buf->is_http_buffer = 1;
     buf->lang = LANG_NONE;
-
-    // Store the URL for reload functionality
     strncpy(buf->http_request, url, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
-
-    // Build wget command with PDF support
     char cmd[2048];
-
-    // Check if URL points to a PDF
     int have_pdftotext = cmd_exists("pdftotext");
     if (is_pdf_url(url) && have_pdftotext) {
-        // Download PDF and convert to text
         snprintf(cmd, sizeof(cmd),
                  "wget -qO- '%s' 2>/dev/null | pdftotext -layout - - 2>&1 || "
                  "echo 'Failed to fetch or convert PDF'",
                  url);
     } else if (is_pdf_url(url) && !have_pdftotext) {
-        // Can't convert, show error
         snprintf(cmd, sizeof(cmd),
                  "echo 'Error: PDF detected but pdftotext not found. Install poppler-utils.'");
     } else {
-        // Regular wget
         snprintf(cmd, sizeof(cmd), "wget -qO- '%s' 2>&1", url);
     }
-
-    // Create a label for the buffer
     char label[256];
     if (is_pdf_url(url)) {
         snprintf(label, sizeof(label), "[wget-PDF: %s]", url);
@@ -985,8 +922,6 @@ int load_wget_response(Buffer *buf, const char *url) {
     }
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
-
-    // Execute the command and capture output
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
 
@@ -1013,7 +948,6 @@ int load_wget_response(Buffer *buf, const char *url) {
 // ============================================================================
 
 int load_w3m_response(Buffer *buf, const char *url) {
-    // Free existing buffer content
     for (int i = 0; i < buf->line_count; i++) {
         free(buf->lines[i]);
         buf->lines[i] = NULL;
@@ -1025,31 +959,24 @@ int load_w3m_response(Buffer *buf, const char *url) {
     buf->is_http_buffer = 1;
     buf->lang = LANG_NONE;
 
-    // Store the URL for reload functionality
     strncpy(buf->http_request, url, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
 
-    // Build w3m command with PDF support
     char cmd[2048];
 
-    // Check if URL points to a PDF
     int have_pdftotext = cmd_exists("pdftotext");
     if (is_pdf_url(url) && have_pdftotext) {
-        // Download PDF and convert to text (using wget since w3m won't help with binary)
         snprintf(cmd, sizeof(cmd),
                  "wget -qO- '%s' 2>/dev/null | pdftotext -layout - - 2>&1 || "
                  "echo 'Failed to fetch or convert PDF'",
                  url);
     } else if (is_pdf_url(url) && !have_pdftotext) {
-        // Can't convert, show error
         snprintf(cmd, sizeof(cmd),
                  "echo 'Error: PDF detected but pdftotext not found. Install poppler-utils.'");
     } else {
-        // Regular w3m
         snprintf(cmd, sizeof(cmd), "w3m -dump '%s' 2>&1", url);
     }
 
-    // Create a label for the buffer
     char label[256];
     if (is_pdf_url(url)) {
         snprintf(label, sizeof(label), "[w3m-PDF: %s]", url);
@@ -1059,7 +986,6 @@ int load_w3m_response(Buffer *buf, const char *url) {
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
 
-    // Execute the command and capture output
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
 
@@ -1083,7 +1009,6 @@ int load_w3m_response(Buffer *buf, const char *url) {
 // --- SQL Database Support ---------------------------------------------------
 
 int load_sql_response(Buffer *buf, const char *db_type, const char *connection, const char *query) {
-    // Free existing buffer content
     for (int i = 0; i < buf->line_count; i++) {
         free(buf->lines[i]);
         buf->lines[i] = NULL;
@@ -1100,8 +1025,6 @@ int load_sql_response(Buffer *buf, const char *db_type, const char *connection, 
 
     if (strcmp(db_type, "sqlite") == 0) {
         if (have_vd) {
-            // VisiData with nice table formatting
-            // Create temp file for query
             char tmpfile[] = "/tmp/peek_sql_XXXXXX";
             int fd = mkstemp(tmpfile);
             if (fd != -1) {
@@ -1110,7 +1033,6 @@ int load_sql_response(Buffer *buf, const char *db_type, const char *connection, 
                     fprintf(f, "%s", query);
                     fclose(f);
 
-                    // Use vd in batch mode with txt output format
                     snprintf(cmd, sizeof(cmd),
                              "vd --batch --output-encoding=utf-8 -f txt "
                              "'sqlite:///%s' --exec ':source %s' 2>&1 || "
@@ -1120,26 +1042,22 @@ int load_sql_response(Buffer *buf, const char *db_type, const char *connection, 
                 } else {
                     close(fd);
                     unlink(tmpfile);
-                    // Fallback to sqlite3
                     snprintf(cmd, sizeof(cmd),
                              "sqlite3 -header -box '%s' \"%s\" 2>&1",
                              connection, query);
                 }
             } else {
-                // Fallback to sqlite3
                 snprintf(cmd, sizeof(cmd),
                          "sqlite3 -header -box '%s' \"%s\" 2>&1",
                          connection, query);
             }
         } else {
-            // Fallback: use sqlite3 with box borders
             snprintf(cmd, sizeof(cmd),
                      "sqlite3 -header -box '%s' \"%s\" 2>&1",
                      connection, query);
         }
     } else if (strcmp(db_type, "postgres") == 0 || strcmp(db_type, "postgresql") == 0) {
         if (have_vd) {
-            // VisiData with PostgreSQL
             char tmpfile[] = "/tmp/peek_sql_XXXXXX";
             int fd = mkstemp(tmpfile);
             if (fd != -1) {
@@ -1157,19 +1075,16 @@ int load_sql_response(Buffer *buf, const char *db_type, const char *connection, 
                 } else {
                     close(fd);
                     unlink(tmpfile);
-                    // Fallback to psql
                     snprintf(cmd, sizeof(cmd),
                              "psql '%s' --pset=border=2 -c \"%s\" 2>&1",
                              connection, query);
                 }
             } else {
-                // Fallback to psql
                 snprintf(cmd, sizeof(cmd),
                          "psql '%s' --pset=border=2 -c \"%s\" 2>&1",
                          connection, query);
             }
         } else {
-            // Fallback: use psql with border=2
             snprintf(cmd, sizeof(cmd),
                      "psql '%s' --pset=border=2 -c \"%s\" 2>&1",
                      connection, query);
@@ -1178,17 +1093,14 @@ int load_sql_response(Buffer *buf, const char *db_type, const char *connection, 
         return -1;
     }
 
-    // Create a label for the buffer
     char label[256];
     snprintf(label, sizeof(label), "[SQL:%s]", db_type);
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
 
-    // Store query for potential reload
     strncpy(buf->http_request, query, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
 
-    // Execute the command and capture output
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
 
@@ -1214,7 +1126,6 @@ void prompt_sql_query(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
 
-    // Create popup window
     int popup_height = 24;
     int popup_width = 70;
     int start_y = (max_y - popup_height) / 2;
@@ -1225,12 +1136,10 @@ void prompt_sql_query(ViewerState *state) {
 
     box(popup, 0, 0);
 
-    // Title
     wattron(popup, A_BOLD);
     mvwprintw(popup, 0, 2, " SQL Query ");
     wattroff(popup, A_BOLD);
 
-    // Help text
     mvwprintw(popup, 2, 2, "Database Type (1=SQLite, 2=PostgreSQL):");
     mvwprintw(popup, 4, 2, "Connection:");
     mvwprintw(popup, 5, 4, "SQLite: /path/to/database.db");
@@ -1240,7 +1149,6 @@ void prompt_sql_query(ViewerState *state) {
     curs_set(1);
     keypad(popup, TRUE);
 
-    // Get database type
     mvwprintw(popup, 2, 44, ">");
     wrefresh(popup);
 
@@ -1255,7 +1163,6 @@ void prompt_sql_query(ViewerState *state) {
     }
     wrefresh(popup);
 
-    // Get connection string
     mvwprintw(popup, 4, 14, ">");
     wmove(popup, 4, 16);
     wrefresh(popup);
@@ -1266,7 +1173,7 @@ void prompt_sql_query(ViewerState *state) {
     while (1) {
         int ch = wgetch(popup);
         if (ch == '\n' || ch == KEY_ENTER) break;
-        else if (ch == 27) { // ESC
+        else if (ch == 27) { 
             curs_set(0);
             delwin(popup);
             touchwin(stdscr);
@@ -1289,7 +1196,6 @@ void prompt_sql_query(ViewerState *state) {
         }
     }
 
-    // Get SQL query (multi-line)
     #define MAX_SQL_LINES 12
     char lines[MAX_SQL_LINES][256];
     for (int i = 0; i < MAX_SQL_LINES; i++) {
@@ -1301,7 +1207,6 @@ void prompt_sql_query(ViewerState *state) {
     int scroll_offset = 0;
     int visible_lines = 12;
 
-    // Redraw query area
     for (int i = 0; i < visible_lines; i++) {
         int y = 10 + i;
         mvwhline(popup, y, 2, ' ', popup_width - 3);
@@ -1313,7 +1218,7 @@ void prompt_sql_query(ViewerState *state) {
     while (1) {
         int ch = wgetch(popup);
 
-        if (ch == 5) { // Ctrl+E
+        if (ch == 5) { 
             break;
         } else if (ch == '\n' || ch == KEY_ENTER) {
             if (current_line < MAX_SQL_LINES - 1) {
@@ -1323,7 +1228,6 @@ void prompt_sql_query(ViewerState *state) {
                     scroll_offset++;
                 }
 
-                // Redraw
                 for (int i = 0; i < visible_lines; i++) {
                     int line_idx = scroll_offset + i;
                     int y = 10 + i;
@@ -1338,7 +1242,7 @@ void prompt_sql_query(ViewerState *state) {
                 wmove(popup, 10 + (current_line - scroll_offset), 4 + pos);
                 wrefresh(popup);
             }
-        } else if (ch == 27) { // ESC
+        } else if (ch == 27) {
             curs_set(0);
             delwin(popup);
             touchwin(stdscr);
@@ -1354,7 +1258,6 @@ void prompt_sql_query(ViewerState *state) {
                 if (current_line < scroll_offset) scroll_offset--;
             }
 
-            // Redraw
             for (int i = 0; i < visible_lines; i++) {
                 int line_idx = scroll_offset + i;
                 int y = 10 + i;
@@ -1381,7 +1284,6 @@ void prompt_sql_query(ViewerState *state) {
     touchwin(stdscr);
     refresh();
 
-    // Combine all lines into one query
     char query[2048] = {0};
     for (int i = 0; i < MAX_SQL_LINES; i++) {
         char *line = lines[i];
@@ -1397,7 +1299,6 @@ void prompt_sql_query(ViewerState *state) {
 
     if (query[0] == '\0' || connection[0] == '\0') return;
 
-    // Execute SQL query
     if (state->buffer_count < MAX_BUFFERS) {
         if (load_sql_response(&state->buffers[state->buffer_count], db_type, connection, query) == 0) {
             state->current_buffer = state->buffer_count;
@@ -1420,7 +1321,6 @@ void prompt_url(ViewerState *state, const char *tool_name,
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
 
-    // Create popup window
     int popup_height = 10;
     int popup_width = 70;
     int start_y = (max_y - popup_height) / 2;
@@ -1431,14 +1331,12 @@ void prompt_url(ViewerState *state, const char *tool_name,
 
     box(popup, 0, 0);
 
-    // Title
     wattron(popup, A_BOLD);
     char title[64];
     snprintf(title, sizeof(title), " %s URL Fetch ", tool_name);
     mvwprintw(popup, 0, 2, "%s", title);
     wattroff(popup, A_BOLD);
 
-    // Help text
     mvwprintw(popup, 2, 2, "Examples:");
     mvwprintw(popup, 3, 4, "https://example.com");
     mvwprintw(popup, 4, 4, "http://httpbin.org/get");
@@ -1459,8 +1357,8 @@ void prompt_url(ViewerState *state, const char *tool_name,
         int ch = wgetch(popup);
 
         if (ch == '\n' || ch == KEY_ENTER) {
-            break; // Execute
-        } else if (ch == 27) { // ESC
+            break; 
+        } else if (ch == 27) { 
             curs_set(0);
             delwin(popup);
             touchwin(stdscr);
@@ -1488,7 +1386,6 @@ void prompt_url(ViewerState *state, const char *tool_name,
     touchwin(stdscr);
     refresh();
 
-    // Trim whitespace
     char *url = input;
     while (*url && isspace((unsigned char)*url)) url++;
     if (*url == '\0') return;
@@ -1496,13 +1393,11 @@ void prompt_url(ViewerState *state, const char *tool_name,
     int len = strlen(url);
     while (len > 0 && isspace((unsigned char)url[len-1])) url[--len] = '\0';
 
-    // Create new buffer for response
     if (state->buffer_count < MAX_BUFFERS) {
         if (loader_func(&state->buffers[state->buffer_count], url) == 0) {
             state->current_buffer = state->buffer_count;
             state->buffer_count++;
         } else {
-            // Show error message briefly
             attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
             mvhline(max_y - 2, 0, ' ', max_x);
             mvprintw(max_y - 2, 1, "Failed to fetch URL with %s", tool_name);
@@ -1511,7 +1406,6 @@ void prompt_url(ViewerState *state, const char *tool_name,
             napms(1500);
         }
     } else {
-        // Buffer limit reached
         attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         mvhline(max_y - 2, 0, ' ', max_x);
         mvprintw(max_y - 2, 1, "Maximum buffer limit reached");
@@ -1521,7 +1415,6 @@ void prompt_url(ViewerState *state, const char *tool_name,
     }
 }
 
-// Helper function for HTTP request popup to redraw visible lines
 static void http_popup_redraw_lines(WINDOW *popup, char lines[][256], int max_lines,
                                      int current_line, int pos, int scroll_offset,
                                      int visible_lines, int popup_width) {
@@ -1529,7 +1422,6 @@ static void http_popup_redraw_lines(WINDOW *popup, char lines[][256], int max_li
         int line_idx = scroll_offset + i;
         int y = 9 + i;
 
-        // Clear line
         mvwhline(popup, y, 2, ' ', popup_width - 3);
 
         if (line_idx < max_lines) {
@@ -1540,7 +1432,6 @@ static void http_popup_redraw_lines(WINDOW *popup, char lines[][256], int max_li
         }
     }
 
-    // Show cursor on current line if visible
     int cursor_y = 9 + (current_line - scroll_offset);
     if (cursor_y >= 9 && cursor_y < 9 + visible_lines) {
         wmove(popup, cursor_y, 4 + pos);
@@ -1553,7 +1444,6 @@ void prompt_http_request(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
 
-    // Create popup window - bigger to accommodate scrolling
     int popup_height = 20;
     int popup_width = 70;
     int start_y = (max_y - popup_height) / 2;
@@ -1564,12 +1454,10 @@ void prompt_http_request(ViewerState *state) {
 
     box(popup, 0, 0);
 
-    // Title
     wattron(popup, A_BOLD);
     mvwprintw(popup, 0, 2, " HTTP Request ");
     wattroff(popup, A_BOLD);
 
-    // Help text
     mvwprintw(popup, 2, 2, "Examples:");
     mvwprintw(popup, 3, 4, "GET httpbin.org/get");
     mvwprintw(popup, 4, 4, "POST httpbin.org/post name=John age:=30");
@@ -1577,7 +1465,6 @@ void prompt_http_request(ViewerState *state) {
 
     mvwprintw(popup, 7, 2, "Enter request (Ctrl+E to execute, ESC to cancel):");
 
-    // More input lines for scrolling
     #define MAX_REQUEST_LINES 10
     char lines[MAX_REQUEST_LINES][256];
     for (int i = 0; i < MAX_REQUEST_LINES; i++) {
@@ -1587,9 +1474,8 @@ void prompt_http_request(ViewerState *state) {
     int current_line = 0;
     int pos = 0;
     int scroll_offset = 0;
-    int visible_lines = 9; // Lines 9-17 in the popup (9 visible lines)
+    int visible_lines = 9; 
 
-    // Don't enable echo - we'll manually display characters
     curs_set(1);
     keypad(popup, TRUE);
 
@@ -1599,15 +1485,13 @@ void prompt_http_request(ViewerState *state) {
     while (1) {
         int ch = wgetch(popup);
 
-        if (ch == 5) { // Ctrl+E
-            break; // Execute
+        if (ch == 5) { 
+            break;
         } else if (ch == '\n' || ch == KEY_ENTER) {
-            // Move to next line
             if (current_line < MAX_REQUEST_LINES - 1) {
                 current_line++;
                 pos = strlen(lines[current_line]);
 
-                // Scroll if needed
                 if (current_line - scroll_offset >= visible_lines) {
                     scroll_offset++;
                 }
@@ -1615,7 +1499,7 @@ void prompt_http_request(ViewerState *state) {
                 http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
                                          scroll_offset, visible_lines, popup_width);
             }
-        } else if (ch == 27) { // ESC
+        } else if (ch == 27) {
             curs_set(0);
             delwin(popup);
             touchwin(stdscr);
@@ -1628,11 +1512,9 @@ void prompt_http_request(ViewerState *state) {
                 http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
                                          scroll_offset, visible_lines, popup_width);
             } else if (current_line > 0) {
-                // Move to previous line
                 current_line--;
                 pos = strlen(lines[current_line]);
 
-                // Scroll if needed
                 if (current_line < scroll_offset) {
                     scroll_offset--;
                 }
@@ -1645,7 +1527,6 @@ void prompt_http_request(ViewerState *state) {
                 current_line--;
                 pos = strlen(lines[current_line]);
 
-                // Scroll if needed
                 if (current_line < scroll_offset) {
                     scroll_offset--;
                 }
@@ -1658,7 +1539,6 @@ void prompt_http_request(ViewerState *state) {
                 current_line++;
                 pos = strlen(lines[current_line]);
 
-                // Scroll if needed
                 if (current_line - scroll_offset >= visible_lines) {
                     scroll_offset++;
                 }
@@ -1679,10 +1559,8 @@ void prompt_http_request(ViewerState *state) {
     touchwin(stdscr);
     refresh();
 
-    // Combine all non-empty lines into one request
     char input[2048] = {0};
     for (int i = 0; i < MAX_REQUEST_LINES; i++) {
-        // Trim whitespace
         char *line = lines[i];
         while (*line && isspace((unsigned char)*line)) line++;
         if (*line == '\0') continue;
@@ -1694,19 +1572,16 @@ void prompt_http_request(ViewerState *state) {
         strncat(input, line, sizeof(input) - strlen(input) - 1);
     }
 
-    // Trim final whitespace
     int len = (int)strlen(input);
     while (len > 0 && isspace((unsigned char)input[len - 1])) input[--len] = '\0';
 
     if (input[0] == '\0') return;
 
-    // Create new buffer for HTTP response
     if (state->buffer_count < MAX_BUFFERS) {
         if (load_http_response(&state->buffers[state->buffer_count], input) == 0) {
             state->current_buffer = state->buffer_count;
             state->buffer_count++;
         } else {
-            // Show error message briefly
             attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
             mvhline(max_y - 2, 0, ' ', max_x);
             mvprintw(max_y - 2, 1, "Failed to execute HTTP request");
@@ -1715,7 +1590,6 @@ void prompt_http_request(ViewerState *state) {
             napms(1500);
         }
     } else {
-        // Buffer limit reached
         attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         mvhline(max_y - 2, 0, ' ', max_x);
         mvprintw(max_y - 2, 1, "Maximum buffer limit reached");
@@ -1732,7 +1606,6 @@ void reload_http_buffer(ViewerState *state) {
     Buffer *buf = &state->buffers[state->current_buffer];
 
     if (!buf->is_http_buffer || buf->http_request[0] == '\0') {
-        // Not an HTTP buffer, show message
         attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         mvhline(max_y - 2, 0, ' ', max_x);
         mvprintw(max_y - 2, 1, "Current buffer is not an HTTP response");
@@ -1742,32 +1615,28 @@ void reload_http_buffer(ViewerState *state) {
         return;
     }
 
-    // Save the request string before reloading
     char saved_request[512];
     strncpy(saved_request, buf->http_request, sizeof(saved_request) - 1);
     saved_request[sizeof(saved_request) - 1] = '\0';
 
-    // Show loading message
     attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
     mvhline(max_y - 2, 0, ' ', max_x);
     mvprintw(max_y - 2, 1, "Reloading HTTP request...");
     attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
     refresh();
 
-    // Determine which loader to use based on the buffer label
     int result = -1;
     if (strstr(buf->filepath, "[wget:") != NULL) {
         result = load_wget_response(buf, saved_request);
     } else if (strstr(buf->filepath, "[w3m:") != NULL) {
         result = load_w3m_response(buf, saved_request);
-    } else if (strstr(buf->filepath, "[RSS:") != NULL) {  // ADD THIS
-        result = load_rss_feed(buf, saved_request);       // ADD THIS
+    } else if (strstr(buf->filepath, "[RSS:") != NULL) {  
+        result = load_rss_feed(buf, saved_request);      
     }  else {
         result = load_http_response(buf, saved_request);
     }
 
     if (result != 0) {
-        // Show error message
         attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         mvhline(max_y - 2, 0, ' ', max_x);
         mvprintw(max_y - 2, 1, "Failed to reload HTTP request");
@@ -1782,7 +1651,6 @@ void close_current_buffer(ViewerState *state) {
     int max_x = getmaxx(stdscr);
 
     if (state->buffer_count <= 1) {
-        // Can't close the last buffer
         attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         mvhline(max_y - 2, 0, ' ', max_x);
         mvprintw(max_y - 2, 1, "Cannot close the last buffer");
@@ -1794,17 +1662,14 @@ void close_current_buffer(ViewerState *state) {
 
     int current = state->current_buffer;
 
-    // Free the buffer
     free_buffer(&state->buffers[current]);
 
-    // Shift all buffers after this one down
     for (int i = current; i < state->buffer_count - 1; i++) {
         state->buffers[i] = state->buffers[i + 1];
     }
 
     state->buffer_count--;
 
-    // Adjust current buffer index
     if (state->current_buffer >= state->buffer_count) {
         state->current_buffer = state->buffer_count - 1;
     }
@@ -1911,7 +1776,6 @@ void copy_selection_to_clipboard(ViewerState *state) {
     int end = state->copy_end_line;
     if (start > end) { int t = start; start = end; end = t; }
 
-    // Best-effort clipboard: xclip OR pbcopy. If neither exists, we silently do nothing.
     FILE *pipe = popen("xclip -selection clipboard 2>/dev/null || pbcopy 2>/dev/null", "w");
     if (!pipe) return;
 
@@ -1926,10 +1790,8 @@ void copy_selection_to_clipboard(ViewerState *state) {
 void draw_tabbar(ViewerState *state) {
     int max_x = getmaxx(stdscr);
 
-    // Don't fill the line - let it be transparent
-    // Just move to the line and draw content
     move(0, 0);
-    clrtoeol();  // Clear to end of line without filling
+    clrtoeol(); 
 
     attron(COLOR_PAIR(COLOR_TABBAR));
     int x = 1;
@@ -1954,7 +1816,6 @@ void draw_tabbar(ViewerState *state) {
     mvprintw(0, max_x - 10, " [%d/%d] ", state->current_buffer + 1, state->buffer_count);
     attroff(COLOR_PAIR(COLOR_TABBAR));
 
-    // Draw white horizontal line below tabbar
     attron(COLOR_PAIR(COLOR_NORMAL));
     mvhline(1, 0, ACS_HLINE, max_x);
     attroff(COLOR_PAIR(COLOR_NORMAL));
@@ -1966,12 +1827,10 @@ void draw_status_bar(ViewerState *state) {
 
     Buffer *buf = &state->buffers[state->current_buffer];
 
-    // Draw white horizontal line above status bar
     attron(COLOR_PAIR(COLOR_NORMAL));
     mvhline(max_y - 2, 0, ACS_HLINE, max_x);
     attroff(COLOR_PAIR(COLOR_NORMAL));
 
-    // Clear the status line without filling
     move(max_y - 1, 0);
     clrtoeol();
 
@@ -1985,7 +1844,6 @@ void draw_status_bar(ViewerState *state) {
     const char *mode = state->copy_mode ? "VISUAL" : "NORMAL";
 
     char left[512];
-    // ADD horizontal scroll position to status (HScroll:X)
     if (state->wrap_enabled) {
         snprintf(left, sizeof(left), "NBL Peek | %s | %s | %d%% | %d/%d lines | L:%s W:%s%s",
                  mode, name, percent,
@@ -2027,7 +1885,6 @@ void draw_buffer(ViewerState *state) {
     int line_nr_width = state->show_line_numbers ? 6 : 0;
 
     if (state->wrap_enabled) {
-        // WRAPPING MODE - ignore horizontal scroll, reset it
         state->horiz_scroll_offset = 0;
 
         int y = content_start_y;
@@ -2071,7 +1928,6 @@ void draw_buffer(ViewerState *state) {
         while (y < content_start_y + content_height) mvhline(y++, 0, ' ', max_x);
 
     } else {
-        // NO WRAPPING MODE - apply horizontal scrolling
         for (int i = 0; i < content_height; i++) {
             int line_idx = buf->scroll_offset + i;
             int y = content_start_y + i;
@@ -2092,18 +1948,14 @@ void draw_buffer(ViewerState *state) {
 
             int in_selection = state->copy_mode && line_idx >= lo && line_idx <= hi;
 
-            // NEW: Apply horizontal scrolling
             const char *line = buf->lines[line_idx];
             int line_len = strlen(line);
 
-            // Skip characters based on horizontal scroll offset
             int start_col = state->horiz_scroll_offset;
             if (start_col >= line_len) {
-                // Scrolled past end of line, show nothing
                 continue;
             }
 
-            // Create a substring starting from the horizontal offset
             char visible_line[MAX_LINE_LEN];
             strncpy(visible_line, line + start_col, sizeof(visible_line) - 1);
             visible_line[sizeof(visible_line) - 1] = '\0';
@@ -2148,7 +2000,6 @@ static void cmd_show_help(void) {
         return;
     }
 
-    // Write help content organized by category
     fprintf(help_file, "=== NAVIGATION ===\n");
     fprintf(help_file, "j / DOWN        | Scroll down one line\n");
     fprintf(help_file, "k / UP          | Scroll up one line\n");
@@ -2230,7 +2081,6 @@ static void cmd_show_help(void) {
     unlink(help_template);
 }
 // --- Input ------------------------------------------------------------------
-// Complete handle_input() function with horizontal scrolling support
 
 void handle_input(ViewerState *state, int *running) {
     int ch = getch();
@@ -2254,7 +2104,7 @@ void handle_input(ViewerState *state, int *running) {
             if (!state->copy_mode) *running = 0;
             break;
 
-        case 27: // ESC
+        case 27: 
             if (state->copy_mode) state->copy_mode = 0;
             break;
 
@@ -2299,11 +2149,9 @@ void handle_input(ViewerState *state, int *running) {
             }
             break;
 
-        // HORIZONTAL SCROLLING - only when wrap is OFF and not in copy mode
         case 'h':
         case KEY_LEFT:
             if (!state->wrap_enabled && !state->copy_mode) {
-                // Scroll left
                 state->horiz_scroll_offset -= state->horiz_scroll_step;
                 if (state->horiz_scroll_offset < 0) {
                     state->horiz_scroll_offset = 0;
@@ -2314,21 +2162,18 @@ void handle_input(ViewerState *state, int *running) {
         case 'l':
         case KEY_RIGHT:
             if (!state->wrap_enabled && !state->copy_mode) {
-                // Scroll right
                 state->horiz_scroll_offset += state->horiz_scroll_step;
-                // Note: no max limit, user can scroll as far as they want
             }
             break;
 
-        case '0':  // Home - jump to column 0
+        case '0': 
             if (!state->wrap_enabled && !state->copy_mode) {
                 state->horiz_scroll_offset = 0;
             }
             break;
 
-        case '$':  // End - jump to see end of longest line
+        case '$': 
             if (!state->wrap_enabled && !state->copy_mode) {
-                // Find longest line in visible area
                 int max_len = 0;
                 for (int i = buf->scroll_offset; i < buf->scroll_offset + visible_lines && i < buf->line_count; i++) {
                     int len = strlen(buf->lines[i]);
@@ -2338,7 +2183,6 @@ void handle_input(ViewerState *state, int *running) {
                 int line_nr_width = state->show_line_numbers ? 6 : 0;
                 int visible_width = max_x - line_nr_width - 1;
 
-                // Scroll to show the end
                 state->horiz_scroll_offset = max_len - visible_width;
                 if (state->horiz_scroll_offset < 0) {
                     state->horiz_scroll_offset = 0;
@@ -2346,16 +2190,13 @@ void handle_input(ViewerState *state, int *running) {
             }
             break;
 
-        // LINE NUMBERS - Changed to uppercase L only (lowercase l is now right-scroll)
         case 'L':
             state->show_line_numbers = !state->show_line_numbers;
             break;
 
-        // WRAP TOGGLE - Reset horizontal scroll when enabling wrap
         case 't':
         case 'T':
             state->wrap_enabled = !state->wrap_enabled;
-            // When toggling wrap on, reset horizontal scroll
             if (state->wrap_enabled) {
                 state->horiz_scroll_offset = 0;
             }
@@ -2379,7 +2220,6 @@ void handle_input(ViewerState *state, int *running) {
                 char filepath[1024] = {0};
 
                 if (pick_file_for_peek(filepath, sizeof(filepath))) {
-                    // Strip leading ./ if present
                     const char *clean_path = filepath;
                     if (filepath[0] == '.' && filepath[1] == '/') {
                         clean_path = filepath + 2;
@@ -2390,7 +2230,6 @@ void handle_input(ViewerState *state, int *running) {
                             state->current_buffer = state->buffer_count;
                             state->buffer_count++;
                         } else {
-                            // Show error
                             int max_y = getmaxy(stdscr);
                             int max_x = getmaxx(stdscr);
                             attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
@@ -2434,7 +2273,7 @@ void handle_input(ViewerState *state, int *running) {
             break;
 
         case 'd':
-        case 4: // Ctrl+D
+        case 4: 
             buf->scroll_offset += visible_lines / 2;
             if (buf->scroll_offset > buf->line_count - visible_lines)
                 buf->scroll_offset = buf->line_count - visible_lines;
@@ -2443,7 +2282,7 @@ void handle_input(ViewerState *state, int *running) {
             break;
 
         case 'u':
-        case 21: // Ctrl+U
+        case 21: 
             buf->scroll_offset -= visible_lines / 2;
             if (buf->scroll_offset < 0) buf->scroll_offset = 0;
             if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
@@ -2473,7 +2312,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Default settings
     state->show_line_numbers = 1;
     state->wrap_enabled = 1;
     state->copy_mode = 0;
@@ -2484,7 +2322,6 @@ int main(int argc, char *argv[]) {
     int loaded_anything = 0;
     int arg_start = 1;
 
-    // Parse flags
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--no-wrap") == 0) {
             state->wrap_enabled = 0;
@@ -2528,7 +2365,6 @@ int main(int argc, char *argv[]) {
                 char label[1024];
                 snprintf(label, sizeof(label), "[%s]", cmd);
 
-                // If cmd is a man command, force plain output
                 if (is_man_command_arg(cmd)) {
                     char cmd2[2048];
                     build_man_cmd_plain(cmd2, sizeof(cmd2), cmd);
