@@ -111,9 +111,9 @@ static void strip_overstrikes(char *s) {
 static void strip_ansi(char *s) {
     char *d = s;
     for (char *p = s; *p; ) {
-        if ((unsigned char)*p == 0x1B) { 
+        if ((unsigned char)*p == 0x1B) {
             p++;
-            if (*p == '[') { 
+            if (*p == '[') {
                 p++;
                 while (*p && !(*p >= '@' && *p <= '~')) p++;
                 if (*p) p++;
@@ -124,7 +124,7 @@ static void strip_ansi(char *s) {
                 if (*p) p++;
                 continue;
             } else {
-                if (*p) p++; 
+                if (*p) p++;
                 continue;
             }
         }
@@ -593,7 +593,7 @@ int load_stdin(Buffer *buf) {
     return buf->line_count > 0 ? 0 : -1;
 }
 static int pick_file_for_peek(char *out, size_t out_len) {
-    int have_nfzf = check_command_exists("nfzf");
+    int have_nfzf = check_command_exists("nf");
     int have_fzf  = check_command_exists("fzf");
 
     if (!have_nfzf && !have_fzf) {
@@ -638,7 +638,7 @@ static int pick_file_for_peek(char *out, size_t out_len) {
 
         if (have_nfzf) {
             snprintf(cmd, sizeof(cmd),
-                     "cd '%s' && %s | nfzf > \"%s\" 2>/dev/null",
+                     "cd '%s' && %s | nf > \"%s\" 2>/dev/null",
                      cwd, find_cmd, tmp_template);
         } else {
             snprintf(cmd, sizeof(cmd),
@@ -651,7 +651,7 @@ static int pick_file_for_peek(char *out, size_t out_len) {
 
         if (have_nfzf) {
             snprintf(cmd, sizeof(cmd),
-                     "cd '%s' && %s | nfzf > \"%s\" 2>/dev/null",
+                     "cd '%s' && %s | nf > \"%s\" 2>/dev/null",
                      cwd, find_cmd, tmp_template);
         } else {
             snprintf(cmd, sizeof(cmd),
@@ -1173,7 +1173,7 @@ void prompt_sql_query(ViewerState *state) {
     while (1) {
         int ch = wgetch(popup);
         if (ch == '\n' || ch == KEY_ENTER) break;
-        else if (ch == 27) { 
+        else if (ch == 27) {
             curs_set(0);
             delwin(popup);
             touchwin(stdscr);
@@ -1218,7 +1218,7 @@ void prompt_sql_query(ViewerState *state) {
     while (1) {
         int ch = wgetch(popup);
 
-        if (ch == 5) { 
+        if (ch == 5) {
             break;
         } else if (ch == '\n' || ch == KEY_ENTER) {
             if (current_line < MAX_SQL_LINES - 1) {
@@ -1357,8 +1357,8 @@ void prompt_url(ViewerState *state, const char *tool_name,
         int ch = wgetch(popup);
 
         if (ch == '\n' || ch == KEY_ENTER) {
-            break; 
-        } else if (ch == 27) { 
+            break;
+        } else if (ch == 27) {
             curs_set(0);
             delwin(popup);
             touchwin(stdscr);
@@ -1474,7 +1474,7 @@ void prompt_http_request(ViewerState *state) {
     int current_line = 0;
     int pos = 0;
     int scroll_offset = 0;
-    int visible_lines = 9; 
+    int visible_lines = 9;
 
     curs_set(1);
     keypad(popup, TRUE);
@@ -1485,7 +1485,7 @@ void prompt_http_request(ViewerState *state) {
     while (1) {
         int ch = wgetch(popup);
 
-        if (ch == 5) { 
+        if (ch == 5) {
             break;
         } else if (ch == '\n' || ch == KEY_ENTER) {
             if (current_line < MAX_REQUEST_LINES - 1) {
@@ -1630,8 +1630,8 @@ void reload_http_buffer(ViewerState *state) {
         result = load_wget_response(buf, saved_request);
     } else if (strstr(buf->filepath, "[w3m:") != NULL) {
         result = load_w3m_response(buf, saved_request);
-    } else if (strstr(buf->filepath, "[RSS:") != NULL) {  
-        result = load_rss_feed(buf, saved_request);      
+    } else if (strstr(buf->filepath, "[RSS:") != NULL) {
+        result = load_rss_feed(buf, saved_request);
     }  else {
         result = load_http_response(buf, saved_request);
     }
@@ -1791,7 +1791,7 @@ void draw_tabbar(ViewerState *state) {
     int max_x = getmaxx(stdscr);
 
     move(0, 0);
-    clrtoeol(); 
+    clrtoeol();
 
     attron(COLOR_PAIR(COLOR_TABBAR));
     int x = 1;
@@ -1974,7 +1974,7 @@ void draw_ui(ViewerState *state) {
     refresh();
 }
 static void cmd_show_help(void) {
-    int have_nfzf = check_command_exists("nfzf");
+    int have_nfzf = check_command_exists("nf");
     int have_fzf  = check_command_exists("fzf");
 
     if (!have_nfzf && !have_fzf) {
@@ -2061,7 +2061,7 @@ static void cmd_show_help(void) {
     char cmd[8192];
     if (have_nfzf) {
         snprintf(cmd, sizeof(cmd),
-                 "nfzf < \"%s\" > /dev/null 2>/dev/null",
+                 "nf < \"%s\" > /dev/null 2>/dev/null",
                  help_template);
     } else {
         snprintf(cmd, sizeof(cmd),
@@ -2104,7 +2104,7 @@ void handle_input(ViewerState *state, int *running) {
             if (!state->copy_mode) *running = 0;
             break;
 
-        case 27: 
+        case 27:
             if (state->copy_mode) state->copy_mode = 0;
             break;
 
@@ -2166,13 +2166,13 @@ void handle_input(ViewerState *state, int *running) {
             }
             break;
 
-        case '0': 
+        case '0':
             if (!state->wrap_enabled && !state->copy_mode) {
                 state->horiz_scroll_offset = 0;
             }
             break;
 
-        case '$': 
+        case '$':
             if (!state->wrap_enabled && !state->copy_mode) {
                 int max_len = 0;
                 for (int i = buf->scroll_offset; i < buf->scroll_offset + visible_lines && i < buf->line_count; i++) {
@@ -2273,7 +2273,7 @@ void handle_input(ViewerState *state, int *running) {
             break;
 
         case 'd':
-        case 4: 
+        case 4:
             buf->scroll_offset += visible_lines / 2;
             if (buf->scroll_offset > buf->line_count - visible_lines)
                 buf->scroll_offset = buf->line_count - visible_lines;
@@ -2282,7 +2282,7 @@ void handle_input(ViewerState *state, int *running) {
             break;
 
         case 'u':
-        case 21: 
+        case 21:
             buf->scroll_offset -= visible_lines / 2;
             if (buf->scroll_offset < 0) buf->scroll_offset = 0;
             if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
