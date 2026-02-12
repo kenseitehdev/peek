@@ -593,7 +593,7 @@ int load_stdin(Buffer *buf) {
     return buf->line_count > 0 ? 0 : -1;
 }
 static int pick_file_for_peek(char *out, size_t out_len) {
-    int have_nfzf = check_command_exists("nf");
+    int have_nfzf = check_command_exists("ff");
     int have_fzf  = check_command_exists("fzf");
 
     if (!have_nfzf && !have_fzf) {
@@ -638,7 +638,7 @@ static int pick_file_for_peek(char *out, size_t out_len) {
 
         if (have_nfzf) {
             snprintf(cmd, sizeof(cmd),
-                     "cd '%s' && %s | nf > \"%s\" 2>/dev/null",
+                     "cd '%s' && %s | ff > \"%s\" 2>/dev/null",
                      cwd, find_cmd, tmp_template);
         } else {
             snprintf(cmd, sizeof(cmd),
@@ -651,7 +651,7 @@ static int pick_file_for_peek(char *out, size_t out_len) {
 
         if (have_nfzf) {
             snprintf(cmd, sizeof(cmd),
-                     "cd '%s' && %s | nf > \"%s\" 2>/dev/null",
+                     "cd '%s' && %s | ff > \"%s\" 2>/dev/null",
                      cwd, find_cmd, tmp_template);
         } else {
             snprintf(cmd, sizeof(cmd),
@@ -1974,7 +1974,7 @@ void draw_ui(ViewerState *state) {
     refresh();
 }
 static void cmd_show_help(void) {
-    int have_nfzf = check_command_exists("nf");
+    int have_nfzf = check_command_exists("ff");
     int have_fzf  = check_command_exists("fzf");
 
     if (!have_nfzf && !have_fzf) {
@@ -1982,7 +1982,7 @@ static void cmd_show_help(void) {
         int max_x = getmaxx(stdscr);
         attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         mvhline(max_y - 2, 0, ' ', max_x);
-        mvprintw(max_y - 2, 1, "fzf or nfzf is required for the help menu");
+        mvprintw(max_y - 2, 1, "fzf or ff is required for the help menu");
         attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         refresh();
         napms(1500);
@@ -2061,7 +2061,7 @@ static void cmd_show_help(void) {
     char cmd[8192];
     if (have_nfzf) {
         snprintf(cmd, sizeof(cmd),
-                 "nf < \"%s\" > /dev/null 2>/dev/null",
+                 "ff < \"%s\" > /dev/null 2>/dev/null",
                  help_template);
     } else {
         snprintf(cmd, sizeof(cmd),
