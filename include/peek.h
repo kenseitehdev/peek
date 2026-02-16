@@ -1,4 +1,8 @@
+#ifndef PEEK_H
+#define PEEK_H
+
 #define _POSIX_C_SOURCE 200809L
+
 #include <ncurses.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +14,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <strings.h>
+#include <signal.h>
+#include <limits.h>
+
 #define MAX_BUFFERS 50
 #define MAX_LINES 10000
 #define MAX_LINE_LEN 2048
@@ -45,7 +52,7 @@ typedef struct {
     Language lang;
     int scroll_offset;
     int is_active;
-    int is_http_buffer;     
+    int is_http_buffer;
 } Buffer;
 
 typedef struct {
@@ -61,10 +68,11 @@ typedef struct {
     int copy_mode;
     int copy_start_line;
     int copy_end_line;
-    int horiz_scroll_offset; 
+    int horiz_scroll_offset;
     int horiz_scroll_step;
 } ViewerState;
 
+// Color pairs
 #define COLOR_NORMAL 1
 #define COLOR_KEYWORD 2
 #define COLOR_STRING 3
@@ -76,4 +84,9 @@ typedef struct {
 #define COLOR_STATUS 9
 #define COLOR_LINENR 10
 #define COLOR_COPY_SELECT 11
- static int is_pdf_file(const char *filepath);
+
+// Function declarations
+static int is_pdf_file(const char *filepath);
+void free_buffer(Buffer *buf);
+
+#endif

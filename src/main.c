@@ -1,63 +1,150 @@
-// peek.c
 #include "../include/peek.h"
+
+static ViewerState *g_state = NULL;
+static SCREEN *g_screen = NULL;
+static FILE *g_tty_in = NULL;
+static char *g_temp_files[10] = {NULL};
+static int g_temp_file_count = 0;
+
+// Register temp file for cleanup
+static void register_temp_file(const char *path) {
+    if (g_temp_file_count < 10 && path) {
+        g_temp_files[g_temp_file_count++] = strdup(path);
+    }
+}
+
+// Cleanup all temp files
+static void cleanup_temp_files(void) {
+    for (int i = 0; i < g_temp_file_count; i++) {
+        if (g_temp_files[i]) {
+            unlink(g_temp_files[i]);
+            free(g_temp_files[i]);
+            g_temp_files[i] = NULL;
+        }
+    }
+    g_temp_file_count = 0;
+}
+
+// Terminal cleanup
+static void cleanup_terminal(void) {
+    if (g_state) {
+        for (int i = 0; i < g_state->buffer_count; i++) {
+            free_buffer(&g_state->buffers[i]);
+        }
+    }
+    endwin();
+    if (g_screen) {
+        delscreen(g_screen);
+        g_screen = NULL;
+    }
+    if (g_tty_in) {
+        fclose(g_tty_in);
+        g_tty_in = NULL;
+    }
+    cleanup_temp_files();
+}
+
+// Signal handler
+static void signal_handler(int signo) {
+    cleanup_terminal();
+    fprintf(stderr, "\nReceived signal %d, exiting...\n", signo);
+    exit(128 + signo);
+}
+
+// Setup signal handlers
+static void setup_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+}
+
+// Shell escape for security
+static char* shell_escape(const char *input) {
+    if (!input) return NULL;
+    size_t len = strlen(input);
+    size_t max_len = len * 4 + 3;
+    char *escaped = malloc(max_len);
+    if (!escaped) return NULL;
+    char *p = escaped;
+    *p++ = '\'';
+    for (size_t i = 0; i < len; i++) {
+        if (input[i] == '\'') {
+            *p++ = '\'';  *p++ = '\\';
+            *p++ = '\'';  *p++ = '\'';
+        } else {
+            *p++ = input[i];
+        }
+    }
+    *p++ = '\'';
+    *p = '\0';
+    return escaped;
+}
+
+// Safe strdup
+static char* safe_strdup(const char *s) {
+    if (!s) return NULL;
+    char *result = strdup(s);
+    if (!result) {
+        fprintf(stderr, "FATAL: Out of memory\n");
+        cleanup_terminal();
+        exit(1);
+    }
+    return result;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
         "  %s [OPTIONS] <file1> [file2 ...]\n"
         "  %s -                       (read from stdin)\n"
         "  cmd | %s                   (read from stdin)\n"
-        "  cmd | %s - file            (stdin + file)\n"
-        "\n"
-        "Options:\n"
-        "  --no-wrap                  Disable line wrapping on startup\n"
-        "\n"
-        "Man buffers (AUTO-DETECT):\n"
-        "  %s \"man grep\" \"man sed\" file1 \"man awk\" file2\n"
-        "\n"
-        "Optional explicit command mode:\n"
-        "  %s -m \"man grep\" -m \"man sed\" file1\n"
-        "  %s -m \"wget -qO- https://example.com\" file1\n"
-        "  %s -m \"w3m -dump https://example.com\" file2\n"
-        "\n"
-        "Keybindings:\n"
-        "  j/k           Scroll down/up\n"
-        "  h/l           Scroll left/right (when wrap is OFF)\n"
-        "  0/$           Jump to start/end of line (when wrap is OFF)\n"
+        "\nOptions:\n"
+        "  --no-wrap                  Disable line wrapping\n"
+        "\nKeybindings:\n"
+        "  j/k, ↓/↑      Scroll down/up\n"
+        "  h/l, ←/→      Scroll left/right (wrap OFF)\n"
+        "  0/$           Jump to line start/end\n"
         "  g/G           Go to top/bottom\n"
-        "  d/u           Half-page down/up\n"
+        "  d/u, ^D/^U    Half-page down/up\n"
         "  /             Search\n"
         "  n/N           Next/previous match\n"
-        "  r             Make HTTP request (opens popup)\n"
-        "  R             Reload current HTTP buffer\n"
-        "  w             Fetch URL with wget (opens popup)\n"
-        "  W             Fetch URL with w3m -dump (opens popup)\n"
-        "  f             Fetch RSS/Atom feed (opens popup)\n"
-        "  s             SQL query (opens popup)\n"
-        "  x             Close current buffer\n"
-        "  o             Open file with fzf\n"
-        "  Tab/Shift-Tab Switch buffers\n"
+        "  r             HTTP request (xh)\n"
+        "  R             Reload buffer\n"
+        "  w             Fetch URL (wget)\n"
+        "  W             Fetch URL (w3m)\n"
+        "  f             Fetch RSS feed\n"
+        "  s             SQL query\n"
+        "  x             Close buffer\n"
+        "  o             Open file (ff)\n"
+        "  Tab/S-Tab     Switch buffers\n"
         "  L             Toggle line numbers\n"
-        "  T             Toggle line wrapping\n"
-        "  v             Enter visual/copy mode\n"
-        "  y             Copy selection (in copy mode)\n"
-        "  Esc           Exit copy mode / Cancel popup\n"
+        "  T             Toggle wrapping\n"
+        "  v             Visual mode\n"
+        "  y             Yank (copy)\n"
+        "  Esc           Exit mode\n"
+        "  ?             Help\n"
         "  q             Quit\n",
-        prog, prog, prog, prog, prog, prog, prog, prog
+        prog, prog, prog
     );
 }
+
 static int starts_with(const char *s, const char *prefix) {
-    size_t n = strlen(prefix);
-    return strncmp(s, prefix, n) == 0;
+    if (!s || !prefix) return 0;
+    return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
 static int contains_substr(const char *s, const char *needle) {
-    return strstr(s, needle) != NULL;
+    return (s && needle) ? (strstr(s, needle) != NULL) : 0;
 }
 
 static int is_man_command_arg(const char *arg) {
     if (!arg || !*arg) return 0;
     if (starts_with(arg, "man ")) return 1;
-
     if (contains_substr(arg, "man ")) {
         const char *p = strstr(arg, "man ");
         return (p && p[4] != '\0');
@@ -81,22 +168,26 @@ static int cmd_exists(const char *name) {
     return 0;
 }
 
-// --- Cleanup helpers ---------------------------------------------------------
-
 static void trim_newlines(char *s) {
     if (!s) return;
     size_t len = strlen(s);
-    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r')) {
+    while (len > 0 && (s[len-1] == '\n' || s[len-1] == '\r')) {
         s[--len] = '\0';
     }
 }
 
 static int check_command_exists(const char *cmd) {
-    char test[256];
-    snprintf(test, sizeof(test), "command -v %s >/dev/null 2>&1", cmd);
-    return system(test) == 0;
+    if (!cmd) return 0;
+    char *escaped = shell_escape(cmd);
+    if (!escaped) return 0;
+    char test[512];
+    snprintf(test, sizeof(test), "command -v %s >/dev/null 2>&1", escaped);
+    free(escaped);
+    return (system(test) == 0);
 }
+
 static void strip_overstrikes(char *s) {
+    if (!s) return;
     char *dst = s;
     for (char *src = s; *src; src++) {
         if (*src == '\b') {
@@ -109,6 +200,7 @@ static void strip_overstrikes(char *s) {
 }
 
 static void strip_ansi(char *s) {
+    if (!s) return;
     char *d = s;
     for (char *p = s; *p; ) {
         if ((unsigned char)*p == 0x1B) {
@@ -134,25 +226,30 @@ static void strip_ansi(char *s) {
 }
 
 static void rtrim(char *s) {
+    if (!s) return;
     int n = (int)strlen(s);
     while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t')) s[--n] = '\0';
 }
 
-// --- Language detection ------------------------------------------------------
-
 Language detect_language(const char *filepath) {
+    if (!filepath) return LANG_NONE;
     const char *ext = strrchr(filepath, '.');
-    if (!ext) return LANG_NONE;
-
+    if (!ext) {
+        if (strstr(filepath, "/man/") || strstr(filepath, ".man")) 
+            return LANG_MAN;
+        return LANG_NONE;
+    }
     if (strcmp(ext, ".c") == 0 || strcmp(ext, ".h") == 0) return LANG_C;
-    if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 || strcmp(ext, ".hpp") == 0 || strcmp(ext, ".cxx") == 0) return LANG_CPP;
+    if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 || 
+        strcmp(ext, ".hpp") == 0 || strcmp(ext, ".cxx") == 0) return LANG_CPP;
     if (strcmp(ext, ".py") == 0) return LANG_PYTHON;
     if (strcmp(ext, ".java") == 0) return LANG_JAVA;
     if (strcmp(ext, ".js") == 0) return LANG_JS;
     if (strcmp(ext, ".ts") == 0 || strcmp(ext, ".tsx") == 0) return LANG_TS;
     if (strcmp(ext, ".html") == 0 || strcmp(ext, ".htm") == 0) return LANG_HTML;
     if (strcmp(ext, ".css") == 0) return LANG_CSS;
-    if (strcmp(ext, ".sh") == 0 || strcmp(ext, ".bash") == 0 || strcmp(ext, ".zsh") == 0) return LANG_SHELL;
+    if (strcmp(ext, ".sh") == 0 || strcmp(ext, ".bash") == 0 || 
+        strcmp(ext, ".zsh") == 0) return LANG_SHELL;
     if (strcmp(ext, ".md") == 0 || strcmp(ext, ".markdown") == 0) return LANG_MARKDOWN;
     if (strcmp(ext, ".rs") == 0) return LANG_RUST;
     if (strcmp(ext, ".go") == 0) return LANG_GO;
@@ -162,122 +259,88 @@ Language detect_language(const char *filepath) {
     if (strcmp(ext, ".json") == 0) return LANG_JSON;
     if (strcmp(ext, ".xml") == 0) return LANG_XML;
     if (strcmp(ext, ".yaml") == 0 || strcmp(ext, ".yml") == 0) return LANG_YAML;
-
     if (strstr(filepath, "/man/") || strstr(filepath, ".man")) return LANG_MAN;
     return LANG_NONE;
 }
 
 int is_c_keyword(const char *word) {
-    const char *keywords[] = {
-        "auto","break","case","char","const","continue","default","do",
-        "double","else","enum","extern","float","for","goto","if",
-        "int","long","register","return","short","signed","sizeof","static",
-        "struct","switch","typedef","union","unsigned","void","volatile","while",
-        NULL
-    };
-    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    const char *kw[] = {"auto","break","case","char","const","continue","default","do",
+        "double","else","enum","extern","float","for","goto","if","int","long","register",
+        "return","short","signed","sizeof","static","struct","switch","typedef","union",
+        "unsigned","void","volatile","while",NULL};
+    for (int i = 0; kw[i]; i++) if (strcmp(word, kw[i]) == 0) return 1;
     return 0;
 }
 
 int is_python_keyword(const char *word) {
-    const char *keywords[] = {
-        "False","None","True","and","as","assert","async","await",
-        "break","class","continue","def","del","elif","else","except",
-        "finally","for","from","global","if","import","in","is",
-        "lambda","nonlocal","not","or","pass","raise","return","try",
-        "while","with","yield",
-        NULL
-    };
-    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    const char *kw[] = {"False","None","True","and","as","assert","async","await","break",
+        "class","continue","def","del","elif","else","except","finally","for","from",
+        "global","if","import","in","is","lambda","nonlocal","not","or","pass","raise",
+        "return","try","while","with","yield",NULL};
+    for (int i = 0; kw[i]; i++) if (strcmp(word, kw[i]) == 0) return 1;
     return 0;
 }
 
 int is_js_keyword(const char *word) {
-    const char *keywords[] = {
-        "async","await","break","case","catch","class","const","continue",
-        "debugger","default","delete","do","else","export","extends","finally",
-        "for","function","if","import","in","instanceof","let","new",
-        "return","super","switch","this","throw","try","typeof","var",
-        "void","while","with","yield",
-        NULL
-    };
-    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    const char *kw[] = {"async","await","break","case","catch","class","const","continue",
+        "debugger","default","delete","do","else","export","extends","finally","for",
+        "function","if","import","in","instanceof","let","new","return","super","switch",
+        "this","throw","try","typeof","var","void","while","with","yield",NULL};
+    for (int i = 0; kw[i]; i++) if (strcmp(word, kw[i]) == 0) return 1;
     return 0;
 }
 
 int is_rust_keyword(const char *word) {
-    const char *keywords[] = {
-        "as","async","await","break","const","continue","crate","dyn",
-        "else","enum","extern","false","fn","for","if","impl","in",
-        "let","loop","match","mod","move","mut","pub","ref","return",
-        "self","Self","static","struct","super","trait","true","type",
-        "unsafe","use","where","while",
-        NULL
-    };
-    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    const char *kw[] = {"as","async","await","break","const","continue","crate","dyn","else",
+        "enum","extern","false","fn","for","if","impl","in","let","loop","match","mod",
+        "move","mut","pub","ref","return","self","Self","static","struct","super","trait",
+        "true","type","unsafe","use","where","while",NULL};
+    for (int i = 0; kw[i]; i++) if (strcmp(word, kw[i]) == 0) return 1;
     return 0;
 }
 
 int is_go_keyword(const char *word) {
-    const char *keywords[] = {
-        "break","case","chan","const","continue","default","defer","else",
-        "fallthrough","for","func","go","goto","if","import","interface",
-        "map","package","range","return","select","struct","switch","type",
-        "var",
-        NULL
-    };
-    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    const char *kw[] = {"break","case","chan","const","continue","default","defer","else",
+        "fallthrough","for","func","go","goto","if","import","interface","map","package",
+        "range","return","select","struct","switch","type","var",NULL};
+    for (int i = 0; kw[i]; i++) if (strcmp(word, kw[i]) == 0) return 1;
     return 0;
 }
 
 int is_ruby_keyword(const char *word) {
-    const char *keywords[] = {
-        "BEGIN","END","alias","and","begin","break","case","class",
-        "def","defined?","do","else","elsif","end","ensure","false",
-        "for","if","in","module","next","nil","not","or","redo",
-        "rescue","retry","return","self","super","then","true","undef",
-        "unless","until","when","while","yield",
-        NULL
-    };
-    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    const char *kw[] = {"BEGIN","END","alias","and","begin","break","case","class","def",
+        "defined?","do","else","elsif","end","ensure","false","for","if","in","module",
+        "next","nil","not","or","redo","rescue","retry","return","self","super","then",
+        "true","undef","unless","until","when","while","yield",NULL};
+    for (int i = 0; kw[i]; i++) if (strcmp(word, kw[i]) == 0) return 1;
     return 0;
 }
 
 int is_php_keyword(const char *word) {
-    const char *keywords[] = {
-        "abstract","and","array","as","break","callable","case","catch",
-        "class","clone","const","continue","declare","default","die","do",
-        "echo","else","elseif","empty","enddeclare","endfor","endforeach",
-        "endif","endswitch","endwhile","eval","exit","extends","final",
-        "finally","for","foreach","function","global","goto","if","implements",
-        "include","include_once","instanceof","insteadof","interface","isset",
-        "list","namespace","new","or","print","private","protected","public",
-        "require","require_once","return","static","switch","throw","trait",
-        "try","unset","use","var","while","xor","yield",
-        NULL
-    };
-    for (int i = 0; keywords[i]; i++) if (strcmp(word, keywords[i]) == 0) return 1;
+    const char *kw[] = {"abstract","and","array","as","break","callable","case","catch",
+        "class","clone","const","continue","declare","default","die","do","echo","else",
+        "elseif","empty","enddeclare","endfor","endforeach","endif","endswitch","endwhile",
+        "eval","exit","extends","final","finally","for","foreach","function","global","goto",
+        "if","implements","include","include_once","instanceof","insteadof","interface",
+        "isset","list","namespace","new","or","print","private","protected","public",
+        "require","require_once","return","static","switch","throw","trait","try","unset",
+        "use","var","while","xor","yield",NULL};
+    for (int i = 0; kw[i]; i++) if (strcmp(word, kw[i]) == 0) return 1;
     return 0;
 }
 
 int is_sql_keyword(const char *word) {
-    const char *keywords[] = {
-        "SELECT","FROM","WHERE","INSERT","UPDATE","DELETE","CREATE","DROP",
-        "ALTER","TABLE","INDEX","VIEW","JOIN","INNER","LEFT","RIGHT","OUTER",
-        "ON","AND","OR","NOT","NULL","IS","IN","LIKE","BETWEEN","ORDER","BY",
-        "GROUP","HAVING","LIMIT","OFFSET","AS","DISTINCT","COUNT","SUM","AVG",
-        "MAX","MIN","UNION","ALL","EXISTS","CASE","WHEN","THEN","ELSE","END",
-        NULL
-    };
-    for (int i = 0; keywords[i]; i++) {
-        if (strcasecmp(word, keywords[i]) == 0) return 1;
-    }
+    const char *kw[] = {"SELECT","FROM","WHERE","INSERT","UPDATE","DELETE","CREATE","DROP",
+        "ALTER","TABLE","INDEX","VIEW","JOIN","INNER","LEFT","RIGHT","OUTER","ON","AND","OR",
+        "NOT","NULL","IS","IN","LIKE","BETWEEN","ORDER","BY","GROUP","HAVING","LIMIT","OFFSET",
+        "AS","DISTINCT","COUNT","SUM","AVG","MAX","MIN","UNION","ALL","EXISTS","CASE","WHEN",
+        "THEN","ELSE","END",NULL};
+    for (int i = 0; kw[i]; i++) if (strcasecmp(word, kw[i]) == 0) return 1;
     return 0;
 }
 
-// --- MAN "syntax highlighting" ----------------------------------------------
-
 static int is_man_section_header(const char *s) {
+    if (!s) return 0;
     int letters = 0;
     for (; *s; s++) {
         if (*s == ' ') continue;
@@ -289,49 +352,62 @@ static int is_man_section_header(const char *s) {
 }
 
 static void draw_tok(int y, int x, const char *s, int i, int j, int max_x, int pair, int bold) {
-    if (x >= max_x) return;
+    if (x >= max_x || !s) return;
     if (bold) attron(COLOR_PAIR(pair) | A_BOLD);
     else attron(COLOR_PAIR(pair));
-
     for (int k = i; k < j && x < max_x; k++) {
         mvaddch(y, x++, s[k]);
     }
-
     if (bold) attroff(COLOR_PAIR(pair) | A_BOLD);
     else attroff(COLOR_PAIR(pair));
 }
 
-// --- Wrapping ---------------------------------------------------------------
-
 typedef struct {
     int count;
+    int capacity;
     char **segments;
 } WrappedLine;
 
 WrappedLine wrap_line(const char *line, int width) {
-    WrappedLine result = {0, NULL};
+    WrappedLine result = {0, 0, NULL};
     if (!line || width <= 0) return result;
-
     int len = (int)strlen(line);
     if (len == 0) {
+        result.capacity = 1;
         result.segments = malloc(sizeof(char*));
-        result.segments[0] = strdup("");
+        if (!result.segments) return result;
+        result.segments[0] = safe_strdup("");
         result.count = 1;
         return result;
     }
-
-    int max_segments = (len / width) + 2;
-    result.segments = malloc(max_segments * sizeof(char*));
-
+    result.capacity = (len / width) + 2;
+    result.segments = malloc(result.capacity * sizeof(char*));
+    if (!result.segments) {
+        result.capacity = 0;
+        return result;
+    }
     int pos = 0;
     while (pos < len) {
+        if (result.count >= result.capacity) {
+            result.capacity *= 2;
+            char **new_seg = realloc(result.segments, result.capacity * sizeof(char*));
+            if (!new_seg) {
+                for (int i = 0; i < result.count; i++) free(result.segments[i]);
+                free(result.segments);
+                return (WrappedLine){0, 0, NULL};
+            }
+            result.segments = new_seg;
+        }
         int remaining = len - pos;
         int take = (remaining > width) ? width : remaining;
-
         char *seg = malloc(take + 1);
+        if (!seg) {
+            for (int i = 0; i < result.count; i++) free(result.segments[i]);
+            free(result.segments);
+            return (WrappedLine){0, 0, NULL};
+        }
         strncpy(seg, line + pos, take);
         seg[take] = '\0';
-
         result.segments[result.count++] = seg;
         pos += take;
     }
@@ -340,13 +416,17 @@ WrappedLine wrap_line(const char *line, int width) {
 
 void free_wrapped_line(WrappedLine *wl) {
     if (!wl || !wl->segments) return;
-    for (int i = 0; i < wl->count; i++) free(wl->segments[i]);
+    for (int i = 0; i < wl->count; i++) {
+        if (wl->segments[i]) {
+            free(wl->segments[i]);
+            wl->segments[i] = NULL;
+        }
+    }
     free(wl->segments);
     wl->segments = NULL;
     wl->count = 0;
+    wl->capacity = 0;
 }
-
-// --- Highlighter ------------------------------------------------------------
 
 void highlight_line(const char *line, Language lang, int y, int start_x, int line_width) {
     if (!line) return;
@@ -355,37 +435,30 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
         while (*p == ' ') p++;
         if (is_man_section_header(p)) {
             attron(COLOR_PAIR(COLOR_KEYWORD) | A_BOLD);
-            mvaddnstr(y, start_x, line, line_width - start_x);
+            int len = line_width - start_x;
+            if (len > 0) mvaddnstr(y, start_x, line, len);
             attroff(COLOR_PAIR(COLOR_KEYWORD) | A_BOLD);
             return;
         }
-
         int len = (int)strlen(line);
-        int i = 0;
-        int x = start_x;
-
+        int i = 0, x = start_x;
         while (i < len && x < line_width) {
             unsigned char ch = (unsigned char)line[i];
-
             if (isspace(ch)) {
                 mvaddch(y, x++, line[i++]);
                 continue;
             }
-
             if (line[i] == '-') {
                 int j = i;
                 while (j < len && !isspace((unsigned char)line[j])) j++;
-
                 draw_tok(y, x, line, i, j, line_width, COLOR_NUMBER, 1);
                 x += (j - i);
                 i = j;
                 continue;
             }
-
             if (isalpha((unsigned char)line[i]) || line[i] == '_') {
                 int j = i;
                 while (j < len && (isalnum((unsigned char)line[j]) || line[j] == '_' || line[j] == '-')) j++;
-
                 int k = j;
                 if (k + 2 < len && line[k] == '(' && isdigit((unsigned char)line[k+1])) {
                     int kk = k+2;
@@ -402,47 +475,35 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
                 while (i < j && x < line_width) mvaddch(y, x++, line[i++]);
                 continue;
             }
-
             mvaddch(y, x++, line[i++]);
         }
         return;
     }
-
-    // --- Code-ish highlighting for other languages --------------------------
     int len = (int)strlen(line);
-    int i = 0;
-    int col = start_x;
-
+    int i = 0, col = start_x;
     while (i < len && col < line_width) {
         char ch = line[i];
-
         if ((lang == LANG_C || lang == LANG_CPP || lang == LANG_JAVA || lang == LANG_JS ||
              lang == LANG_TS || lang == LANG_CSS || lang == LANG_RUST || lang == LANG_GO || lang == LANG_PHP) &&
             i + 1 < len && line[i] == '/' && line[i+1] == '/') {
             attron(COLOR_PAIR(COLOR_COMMENT));
-            int j = i;
-            while (j < len && col < line_width) mvaddch(y, col++, line[j++]);
+            while (i < len && col < line_width) mvaddch(y, col++, line[i++]);
             attroff(COLOR_PAIR(COLOR_COMMENT));
             break;
         }
-
         if ((lang == LANG_PYTHON || lang == LANG_SHELL || lang == LANG_RUBY ||
              lang == LANG_YAML || lang == LANG_PHP) && ch == '#') {
             attron(COLOR_PAIR(COLOR_COMMENT));
-            int j = i;
-            while (j < len && col < line_width) mvaddch(y, col++, line[j++]);
+            while (i < len && col < line_width) mvaddch(y, col++, line[i++]);
             attroff(COLOR_PAIR(COLOR_COMMENT));
             break;
         }
-
         if (lang == LANG_SQL && i + 1 < len && line[i] == '-' && line[i+1] == '-') {
             attron(COLOR_PAIR(COLOR_COMMENT));
-            int j = i;
-            while (j < len && col < line_width) mvaddch(y, col++, line[j++]);
+            while (i < len && col < line_width) mvaddch(y, col++, line[i++]);
             attroff(COLOR_PAIR(COLOR_COMMENT));
             break;
         }
-
         if (ch == '"' || ch == '\'') {
             char quote = ch;
             attron(COLOR_PAIR(COLOR_STRING));
@@ -469,7 +530,6 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             attroff(COLOR_PAIR(COLOR_NUMBER));
             continue;
         }
-
         if (isalpha((unsigned char)ch) || ch == '_') {
             char word[128] = {0};
             int w = 0;
@@ -477,7 +537,6 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
                 word[w++] = line[i++];
             }
             word[w] = '\0';
-
             int is_keyword = 0;
             if (lang == LANG_C || lang == LANG_CPP) is_keyword = is_c_keyword(word);
             else if (lang == LANG_PYTHON) is_keyword = is_python_keyword(word);
@@ -487,21 +546,42 @@ void highlight_line(const char *line, Language lang, int y, int start_x, int lin
             else if (lang == LANG_RUBY) is_keyword = is_ruby_keyword(word);
             else if (lang == LANG_PHP) is_keyword = is_php_keyword(word);
             else if (lang == LANG_SQL) is_keyword = is_sql_keyword(word);
-
             if (is_keyword) attron(COLOR_PAIR(COLOR_KEYWORD) | A_BOLD);
-
             for (int k = 0; k < w && col < line_width; k++) mvaddch(y, col++, word[k]);
-
             if (is_keyword) attroff(COLOR_PAIR(COLOR_KEYWORD) | A_BOLD);
             continue;
         }
-
         mvaddch(y, col++, ch);
         i++;
     }
 }
 
-// --- Loaders ----------------------------------------------------------------
+static int is_pdf_url(const char *url) {
+    if (!url) return 0;
+    int len = strlen(url);
+    if (len < 4) return 0;
+    const char *ext = url + len - 4;
+    if (strcasecmp(ext, ".pdf") == 0) return 1;
+    
+    // Check for .pdf? or .PDF? (case-insensitive search)
+    for (const char *p = url; *p; p++) {
+        if ((p[0] == '.' || p[0] == '.') &&
+            (p[1] == 'p' || p[1] == 'P') &&
+            (p[2] == 'd' || p[2] == 'D') &&
+            (p[3] == 'f' || p[3] == 'F') &&
+            p[4] == '?') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int is_pdf_file(const char *filepath) {
+    if (!filepath) return 0;
+    const char *ext = strrchr(filepath, '.');
+    if (!ext) return 0;
+    return (strcasecmp(ext, ".pdf") == 0);
+}
 
 int load_file(Buffer *buf, const char *filepath) {
     if (is_pdf_file(filepath)) {
@@ -515,38 +595,31 @@ int load_file(Buffer *buf, const char *filepath) {
             buf->is_active = 1;
             buf->is_http_buffer = 0;
             buf->http_request[0] = '\0';
-
+            char *esc = shell_escape(filepath);
+            if (!esc) return -1;
             char cmd[2048];
-            snprintf(cmd, sizeof(cmd), "pdftotext -layout '%s' - 2>/dev/null", filepath);
-
+            snprintf(cmd, sizeof(cmd), "pdftotext -layout %s - 2>/dev/null", esc);
+            free(esc);
             FILE *p = popen(cmd, "r");
             if (!p) return -1;
-
             char line[MAX_LINE_LEN];
             while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
                 size_t len = strlen(line);
                 while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-
                 strip_overstrikes(line);
                 strip_ansi(line);
                 rtrim(line);
-
-                buf->lines[buf->line_count++] = strdup(line);
+                buf->lines[buf->line_count++] = safe_strdup(line);
             }
-
-            int rc = pclose(p);
-            (void)rc;
-
+            pclose(p);
             return (buf->line_count > 0) ? 0 : -1;
         } else {
-            fprintf(stderr, "Warning: pdftotext not found. Install poppler-utils to view PDFs.\n");
+            fprintf(stderr, "Warning: pdftotext not found. Install poppler-utils.\n");
             return -1;
         }
     }
-
     FILE *f = fopen(filepath, "r");
     if (!f) return -1;
-
     buf->line_count = 0;
     buf->scroll_offset = 0;
     strncpy(buf->filepath, filepath, sizeof(buf->filepath) - 1);
@@ -555,19 +628,18 @@ int load_file(Buffer *buf, const char *filepath) {
     buf->is_active = 1;
     buf->is_http_buffer = 0;
     buf->http_request[0] = '\0';
-
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), f) && buf->line_count < MAX_LINES) {
         line[strcspn(line, "\n")] = 0;
         strip_overstrikes(line);
         strip_ansi(line);
         rtrim(line);
-        buf->lines[buf->line_count++] = strdup(line);
+        buf->lines[buf->line_count++] = safe_strdup(line);
     }
-
     fclose(f);
     return 0;
 }
+
 int load_stdin(Buffer *buf) {
     buf->line_count = 0;
     buf->scroll_offset = 0;
@@ -577,158 +649,114 @@ int load_stdin(Buffer *buf) {
     buf->is_active = 1;
     buf->is_http_buffer = 0;
     buf->http_request[0] = '\0';
-
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), stdin) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
-
         strip_overstrikes(line);
         strip_ansi(line);
         rtrim(line);
-
-        buf->lines[buf->line_count++] = strdup(line);
+        buf->lines[buf->line_count++] = safe_strdup(line);
     }
-
     return buf->line_count > 0 ? 0 : -1;
 }
-static int pick_file_for_peek(char *out, size_t out_len) {
-    int have_nfzf = check_command_exists("ff");
-    int have_fzf  = check_command_exists("fzf");
 
-    if (!have_nfzf && !have_fzf) {
+static int pick_file_for_peek(char *out, size_t out_len) {
+    int have_ff = check_command_exists("ff");
+    if (!have_ff) {
         def_prog_mode();
         endwin();
-
         char input[1024] = {0};
         printf("\nEnter file path to open: ");
         fflush(stdout);
-
         if (!fgets(input, sizeof(input), stdin)) {
             reset_prog_mode();
             refresh();
             return 0;
         }
-
         reset_prog_mode();
         refresh();
-
         trim_newlines(input);
         if (input[0] == '\0') return 0;
-
         strncpy(out, input, out_len - 1);
         out[out_len - 1] = '\0';
         return 1;
     }
-
     char cwd[1024];
     if (!getcwd(cwd, sizeof(cwd))) return 0;
-
     char tmp_template[] = "/tmp/peek_pick_XXXXXX";
     int fd = mkstemp(tmp_template);
     if (fd < 0) return 0;
-    close(fd);
-
+    register_temp_file(tmp_template);
     int has_fd = check_command_exists("fd");
     char cmd[8192];
-
-    if (has_fd) {
-        const char *find_cmd = "fd -L -t f . --exclude .git --exclude node_modules "
-                               "--exclude build --exclude dist --exclude .cache 2>/dev/null";
-
-        if (have_nfzf) {
-            snprintf(cmd, sizeof(cmd),
-                     "cd '%s' && %s | ff > \"%s\" 2>/dev/null",
-                     cwd, find_cmd, tmp_template);
-        } else {
-            snprintf(cmd, sizeof(cmd),
-                     "cd '%s' && %s | fzf --prompt='Open File> ' --height=40%% --reverse "
-                     "< /dev/tty > \"%s\" 2> /dev/tty",
-                     cwd, find_cmd, tmp_template);
-        }
-    } else {
-        const char *find_cmd = "find . -type f 2>/dev/null";
-
-        if (have_nfzf) {
-            snprintf(cmd, sizeof(cmd),
-                     "cd '%s' && %s | ff > \"%s\" 2>/dev/null",
-                     cwd, find_cmd, tmp_template);
-        } else {
-            snprintf(cmd, sizeof(cmd),
-                     "cd '%s' && %s | fzf --prompt='Open File> ' --height=40%% --reverse "
-                     "< /dev/tty > \"%s\" 2> /dev/tty",
-                     cwd, find_cmd, tmp_template);
-        }
+    const char *find_cmd = has_fd ? 
+        "fd -L -t f . --exclude .git --exclude node_modules --exclude build --exclude dist --exclude .cache 2>/dev/null" :
+        "find . -type f 2>/dev/null";
+    char *esc_cwd = shell_escape(cwd);
+    char *esc_tmp = shell_escape(tmp_template);
+    if (!esc_cwd || !esc_tmp) {
+        if (esc_cwd) free(esc_cwd);
+        if (esc_tmp) free(esc_tmp);
+        close(fd);
+        return 0;
     }
-
+    snprintf(cmd, sizeof(cmd), "cd %s && %s | ff > %s 2>/dev/null", esc_cwd, find_cmd, esc_tmp);
+    free(esc_cwd);
+    free(esc_tmp);
     def_prog_mode();
     endwin();
     int rc = system(cmd);
     reset_prog_mode();
     refresh();
-
     if (rc != 0) {
-        unlink(tmp_template);
+        close(fd);
         return 0;
     }
-
-    FILE *f = fopen(tmp_template, "r");
+    FILE *f = fdopen(fd, "r");
     if (!f) {
-        unlink(tmp_template);
+        close(fd);
         return 0;
     }
-
     char buf[1024] = {0};
     if (!fgets(buf, sizeof(buf), f)) {
         fclose(f);
-        unlink(tmp_template);
         return 0;
     }
     fclose(f);
-    unlink(tmp_template);
-
     trim_newlines(buf);
     if (buf[0] == '\0') return 0;
-
     strncpy(out, buf, out_len - 1);
     out[out_len - 1] = '\0';
     return 1;
 }
+
 static int load_command(Buffer *buf, const char *label, const char *cmd, Language lang) {
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
-
     buf->line_count = 0;
     buf->scroll_offset = 0;
     buf->is_active = 1;
     buf->lang = lang;
     buf->is_http_buffer = 0;
     buf->http_request[0] = '\0';
-
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
-
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-
         strip_overstrikes(line);
         strip_ansi(line);
         rtrim(line);
-
-        buf->lines[buf->line_count++] = strdup(line);
+        buf->lines[buf->line_count++] = safe_strdup(line);
     }
-
-    int rc = pclose(p);
-    (void)rc;
-
+    pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
 }
 
 static void build_man_cmd_plain(char *out, size_t outsz, const char *man_cmd) {
     int have_col = cmd_exists("col");
-
     if (have_col) {
         snprintf(out, outsz, "MANPAGER=cat %s 2>/dev/null | col -bx", man_cmd);
     } else {
@@ -738,83 +766,74 @@ static void build_man_cmd_plain(char *out, size_t outsz, const char *man_cmd) {
 
 void free_buffer(Buffer *buf) {
     for (int i = 0; i < buf->line_count; i++) {
-        free(buf->lines[i]);
-        buf->lines[i] = NULL;
+        if (buf->lines[i]) {
+            free(buf->lines[i]);
+            buf->lines[i] = NULL;
+        }
     }
     buf->line_count = 0;
     buf->is_active = 0;
 }
 
-// --- HTTP Request Functions -------------------------------------------------
-
 int load_http_response(Buffer *buf, const char *request_input) {
     for (int i = 0; i < buf->line_count; i++) {
-        free(buf->lines[i]);
-        buf->lines[i] = NULL;
+        if (buf->lines[i]) {
+            free(buf->lines[i]);
+            buf->lines[i] = NULL;
+        }
     }
-
     buf->line_count = 0;
     buf->scroll_offset = 0;
     buf->is_active = 1;
     buf->is_http_buffer = 1;
     buf->lang = LANG_NONE;
-
     strncpy(buf->http_request, request_input, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
+    char label[256];
+    snprintf(label, sizeof(label), "HTTP: %s", request_input);
+    strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
+    buf->filepath[sizeof(buf->filepath) - 1] = '\0';
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
              "OUTPUT=$(xh --print=hb --pretty=format %s 2>&1); "
              "echo \"$OUTPUT\" | jq -C . 2>/dev/null || echo \"$OUTPUT\"",
              request_input);
-
-    char label[256];
-    snprintf(label, sizeof(label), "[HTTP: %s]", request_input);
-    strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
-    buf->filepath[sizeof(buf->filepath) - 1] = '\0';
-
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
-
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-
         strip_overstrikes(line);
         strip_ansi(line);
         rtrim(line);
-
-        buf->lines[buf->line_count++] = strdup(line);
+        buf->lines[buf->line_count++] = safe_strdup(line);
     }
-
-    int rc = pclose(p);
-    (void)rc;
-
+    pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
 }
-// --- RSS Feed Support -------------------------------------------------------
 
 int load_rss_feed(Buffer *buf, const char *url) {
     for (int i = 0; i < buf->line_count; i++) {
-        free(buf->lines[i]);
-        buf->lines[i] = NULL;
+        if (buf->lines[i]) {
+            free(buf->lines[i]);
+            buf->lines[i] = NULL;
+        }
     }
-
     buf->line_count = 0;
     buf->scroll_offset = 0;
     buf->is_active = 1;
     buf->is_http_buffer = 1;
     buf->lang = LANG_NONE;
-
     strncpy(buf->http_request, url, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
-
+    char *esc_url = shell_escape(url);
+    if (!esc_url) return -1;
     char cmd[4096];
     int have_xmllint = cmd_exists("xmllint");
-
     if (have_xmllint) {
         snprintf(cmd, sizeof(cmd),
-                 "curl -sL '%s' 2>&1 | xmllint --format - 2>/dev/null | "
+                 "curl -sL %s 2>&1 | xmllint --format - 2>/dev/null | "
                  "awk 'BEGIN{RS=\"<item>\"; FS=\"\\n\"} "
                  "NR>1 { "
                  "  print \"\\n═══════════════════════════════════════════════════════════════════\"; "
@@ -825,75 +844,45 @@ int load_rss_feed(Buffer *buf, const char *url) {
                  "    if ($i ~ /<description>/) { gsub(/<[^>]*>/, \"\", $i); gsub(/^[ \\t]+|[ \\t]+$/, \"\", $i); if($i) print \"\\n\" $i \"\\n\" } "
                  "  } "
                  "}'",
-                 url);
+                 esc_url);
     } else {
         snprintf(cmd, sizeof(cmd),
-                 "curl -sL '%s' 2>&1 | "
+                 "curl -sL %s 2>&1 | "
                  "sed 's/></>\\\n</g' | "
                  "grep -E '(title>|link>|pubDate>|description>)' | "
                  "sed 's/<title>/\\n=== /g; s/<\\/title>/ ===/g; "
                  "s/<link>/Link: /g; s/<\\/link>//g; "
                  "s/<pubDate>/Date: /g; s/<\\/pubDate>//g; "
                  "s/<description>//g; s/<\\/description>/\\n/g'",
-                 url);
+                 esc_url);
     }
-
+    free(esc_url);
     char label[256];
-    snprintf(label, sizeof(label), "[RSS: %s]", url);
+    snprintf(label, sizeof(label), "RSS: %s", url);
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
-
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
-
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-
         strip_overstrikes(line);
         strip_ansi(line);
         rtrim(line);
-
-        buf->lines[buf->line_count++] = strdup(line);
+        buf->lines[buf->line_count++] = safe_strdup(line);
     }
-
-    int rc = pclose(p);
-    (void)rc;
-
+    pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
 }
-// --- wget support -----------------------------------------------------------
-static int is_pdf_url(const char *url) {
-    if (!url) return 0;
-    int len = strlen(url);
-    if (len < 4) return 0;
-
-    const char *ext = url + len - 4;
-    if (strcasecmp(ext, ".pdf") == 0) return 1;
-
-    if (strstr(url, ".pdf?") || strstr(url, ".PDF?")) return 1;
-
-    return 0;
-}
-
-static int is_pdf_file(const char *filepath) {
-    if (!filepath) return 0;
-    const char *ext = strrchr(filepath, '.');
-    if (!ext) return 0;
-    return (strcasecmp(ext, ".pdf") == 0);
-}
-
-// ============================================================================
-// Modified load_wget_response() - handles PDF URLs
-// ============================================================================
 
 int load_wget_response(Buffer *buf, const char *url) {
     for (int i = 0; i < buf->line_count; i++) {
-        free(buf->lines[i]);
-        buf->lines[i] = NULL;
+        if (buf->lines[i]) {
+            free(buf->lines[i]);
+            buf->lines[i] = NULL;
+        }
     }
-
     buf->line_count = 0;
     buf->scroll_offset = 0;
     buf->is_active = 1;
@@ -901,260 +890,252 @@ int load_wget_response(Buffer *buf, const char *url) {
     buf->lang = LANG_NONE;
     strncpy(buf->http_request, url, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
+    char *esc_url = shell_escape(url);
+    if (!esc_url) return -1;
     char cmd[2048];
     int have_pdftotext = cmd_exists("pdftotext");
     if (is_pdf_url(url) && have_pdftotext) {
         snprintf(cmd, sizeof(cmd),
-                 "wget -qO- '%s' 2>/dev/null | pdftotext -layout - - 2>&1 || "
+                 "wget -qO- %s 2>/dev/null | pdftotext -layout - - 2>&1 || "
                  "echo 'Failed to fetch or convert PDF'",
-                 url);
+                 esc_url);
     } else if (is_pdf_url(url) && !have_pdftotext) {
+        free(esc_url);
         snprintf(cmd, sizeof(cmd),
                  "echo 'Error: PDF detected but pdftotext not found. Install poppler-utils.'");
     } else {
-        snprintf(cmd, sizeof(cmd), "wget -qO- '%s' 2>&1", url);
+        snprintf(cmd, sizeof(cmd), "wget -qO- %s 2>&1", esc_url);
     }
+    free(esc_url);
     char label[256];
     if (is_pdf_url(url)) {
-        snprintf(label, sizeof(label), "[wget-PDF: %s]", url);
+        snprintf(label, sizeof(label), "wget-PDF: %s", url);
     } else {
-        snprintf(label, sizeof(label), "[wget: %s]", url);
+        snprintf(label, sizeof(label), "wget: %s", url);
     }
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
-
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-
         strip_overstrikes(line);
         strip_ansi(line);
         rtrim(line);
-
-        buf->lines[buf->line_count++] = strdup(line);
+        buf->lines[buf->line_count++] = safe_strdup(line);
     }
-
-    int rc = pclose(p);
-    (void)rc;
-
+    pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
 }
-
-// ============================================================================
-// Modified load_w3m_response() - handles PDF URLs
-// ============================================================================
 
 int load_w3m_response(Buffer *buf, const char *url) {
     for (int i = 0; i < buf->line_count; i++) {
-        free(buf->lines[i]);
-        buf->lines[i] = NULL;
+        if (buf->lines[i]) {
+            free(buf->lines[i]);
+            buf->lines[i] = NULL;
+        }
     }
-
     buf->line_count = 0;
     buf->scroll_offset = 0;
     buf->is_active = 1;
     buf->is_http_buffer = 1;
     buf->lang = LANG_NONE;
-
     strncpy(buf->http_request, url, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
-
+    char *esc_url = shell_escape(url);
+    if (!esc_url) return -1;
     char cmd[2048];
-
     int have_pdftotext = cmd_exists("pdftotext");
     if (is_pdf_url(url) && have_pdftotext) {
         snprintf(cmd, sizeof(cmd),
-                 "wget -qO- '%s' 2>/dev/null | pdftotext -layout - - 2>&1 || "
+                 "wget -qO- %s 2>/dev/null | pdftotext -layout - - 2>&1 || "
                  "echo 'Failed to fetch or convert PDF'",
-                 url);
+                 esc_url);
     } else if (is_pdf_url(url) && !have_pdftotext) {
+        free(esc_url);
         snprintf(cmd, sizeof(cmd),
                  "echo 'Error: PDF detected but pdftotext not found. Install poppler-utils.'");
     } else {
-        snprintf(cmd, sizeof(cmd), "w3m -dump '%s' 2>&1", url);
+        snprintf(cmd, sizeof(cmd), "w3m -dump %s 2>&1", esc_url);
     }
-
+    free(esc_url);
     char label[256];
     if (is_pdf_url(url)) {
-        snprintf(label, sizeof(label), "[w3m-PDF: %s]", url);
+        snprintf(label, sizeof(label), "w3m-PDF: %s", url);
     } else {
-        snprintf(label, sizeof(label), "[w3m: %s]", url);
+        snprintf(label, sizeof(label), "w3m: %s", url);
     }
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
-
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
-
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-
         strip_overstrikes(line);
         strip_ansi(line);
         rtrim(line);
-
-        buf->lines[buf->line_count++] = strdup(line);
+        buf->lines[buf->line_count++] = safe_strdup(line);
     }
-
-    int rc = pclose(p);
-    (void)rc;
-
+    pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
 }
-// --- SQL Database Support ---------------------------------------------------
 
 int load_sql_response(Buffer *buf, const char *db_type, const char *connection, const char *query) {
     for (int i = 0; i < buf->line_count; i++) {
-        free(buf->lines[i]);
-        buf->lines[i] = NULL;
+        if (buf->lines[i]) {
+            free(buf->lines[i]);
+            buf->lines[i] = NULL;
+        }
     }
-
     buf->line_count = 0;
     buf->scroll_offset = 0;
     buf->is_active = 1;
     buf->is_http_buffer = 0;
     buf->lang = LANG_NONE;
-
+    char *esc_conn = shell_escape(connection);
+    char *esc_query = shell_escape(query);
+    if (!esc_conn || !esc_query) {
+        if (esc_conn) free(esc_conn);
+        if (esc_query) free(esc_query);
+        return -1;
+    }
     char cmd[4096];
     int have_vd = cmd_exists("vd");
-
     if (strcmp(db_type, "sqlite") == 0) {
         if (have_vd) {
             char tmpfile[] = "/tmp/peek_sql_XXXXXX";
             int fd = mkstemp(tmpfile);
             if (fd != -1) {
+                register_temp_file(tmpfile);
                 FILE *f = fdopen(fd, "w");
                 if (f) {
                     fprintf(f, "%s", query);
                     fclose(f);
-
-                    snprintf(cmd, sizeof(cmd),
-                             "vd --batch --output-encoding=utf-8 -f txt "
-                             "'sqlite:///%s' --exec ':source %s' 2>&1 || "
-                             "sqlite3 -header -box '%s' \"%s\" 2>&1",
-                             connection, tmpfile, connection, query);
-                    unlink(tmpfile);
+                    char *esc_tmp = shell_escape(tmpfile);
+                    if (esc_tmp) {
+                        snprintf(cmd, sizeof(cmd),
+                                 "vd --batch --output-encoding=utf-8 -f txt "
+                                 "'sqlite:///%s' --exec ':source %s' 2>&1 || "
+                                 "sqlite3 -header -box %s %s 2>&1",
+                                 connection, esc_tmp, esc_conn, esc_query);
+                        free(esc_tmp);
+                    } else {
+                        snprintf(cmd, sizeof(cmd),
+                                 "sqlite3 -header -box %s %s 2>&1",
+                                 esc_conn, esc_query);
+                    }
                 } else {
                     close(fd);
-                    unlink(tmpfile);
                     snprintf(cmd, sizeof(cmd),
-                             "sqlite3 -header -box '%s' \"%s\" 2>&1",
-                             connection, query);
+                             "sqlite3 -header -box %s %s 2>&1",
+                             esc_conn, esc_query);
                 }
             } else {
                 snprintf(cmd, sizeof(cmd),
-                         "sqlite3 -header -box '%s' \"%s\" 2>&1",
-                         connection, query);
+                         "sqlite3 -header -box %s %s 2>&1",
+                         esc_conn, esc_query);
             }
         } else {
             snprintf(cmd, sizeof(cmd),
-                     "sqlite3 -header -box '%s' \"%s\" 2>&1",
-                     connection, query);
+                     "sqlite3 -header -box %s %s 2>&1",
+                     esc_conn, esc_query);
         }
     } else if (strcmp(db_type, "postgres") == 0 || strcmp(db_type, "postgresql") == 0) {
         if (have_vd) {
             char tmpfile[] = "/tmp/peek_sql_XXXXXX";
             int fd = mkstemp(tmpfile);
             if (fd != -1) {
+                register_temp_file(tmpfile);
                 FILE *f = fdopen(fd, "w");
                 if (f) {
                     fprintf(f, "%s", query);
                     fclose(f);
-
-                    snprintf(cmd, sizeof(cmd),
-                             "vd --batch --output-encoding=utf-8 -f txt "
-                             "'%s' --exec ':source %s' 2>&1 || "
-                             "psql '%s' --pset=border=2 -c \"%s\" 2>&1",
-                             connection, tmpfile, connection, query);
-                    unlink(tmpfile);
+                    char *esc_tmp = shell_escape(tmpfile);
+                    if (esc_tmp) {
+                        snprintf(cmd, sizeof(cmd),
+                                 "vd --batch --output-encoding=utf-8 -f txt "
+                                 "%s --exec ':source %s' 2>&1 || "
+                                 "psql %s --pset=border=2 -c %s 2>&1",
+                                 esc_conn, esc_tmp, esc_conn, esc_query);
+                        free(esc_tmp);
+                    } else {
+                        snprintf(cmd, sizeof(cmd),
+                                 "psql %s --pset=border=2 -c %s 2>&1",
+                                 esc_conn, esc_query);
+                    }
                 } else {
                     close(fd);
-                    unlink(tmpfile);
                     snprintf(cmd, sizeof(cmd),
-                             "psql '%s' --pset=border=2 -c \"%s\" 2>&1",
-                             connection, query);
+                             "psql %s --pset=border=2 -c %s 2>&1",
+                             esc_conn, esc_query);
                 }
             } else {
                 snprintf(cmd, sizeof(cmd),
-                         "psql '%s' --pset=border=2 -c \"%s\" 2>&1",
-                         connection, query);
+                         "psql %s --pset=border=2 -c %s 2>&1",
+                         esc_conn, esc_query);
             }
         } else {
             snprintf(cmd, sizeof(cmd),
-                     "psql '%s' --pset=border=2 -c \"%s\" 2>&1",
-                     connection, query);
+                     "psql %s --pset=border=2 -c %s 2>&1",
+                     esc_conn, esc_query);
         }
     } else {
+        free(esc_conn);
+        free(esc_query);
         return -1;
     }
-
+    free(esc_conn);
+    free(esc_query);
     char label[256];
-    snprintf(label, sizeof(label), "[SQL:%s]", db_type);
+    snprintf(label, sizeof(label), "SQL:%s", db_type);
     strncpy(buf->filepath, label, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
-
     strncpy(buf->http_request, query, sizeof(buf->http_request) - 1);
     buf->http_request[sizeof(buf->http_request) - 1] = '\0';
-
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
-
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-
         strip_overstrikes(line);
         strip_ansi(line);
         rtrim(line);
-
-        buf->lines[buf->line_count++] = strdup(line);
+        buf->lines[buf->line_count++] = safe_strdup(line);
     }
-
-    int rc = pclose(p);
-    (void)rc;
-
+    pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
 }
+
 
 void prompt_sql_query(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
-
     int popup_height = 24;
     int popup_width = 70;
     int start_y = (max_y - popup_height) / 2;
     int start_x = (max_x - popup_width) / 2;
-
     WINDOW *popup = newwin(popup_height, popup_width, start_y, start_x);
     if (!popup) return;
-
     box(popup, 0, 0);
-
     wattron(popup, A_BOLD);
     mvwprintw(popup, 0, 2, " SQL Query ");
     wattroff(popup, A_BOLD);
-
     mvwprintw(popup, 2, 2, "Database Type (1=SQLite, 2=PostgreSQL):");
     mvwprintw(popup, 4, 2, "Connection:");
     mvwprintw(popup, 5, 4, "SQLite: /path/to/database.db");
     mvwprintw(popup, 6, 4, "PostgreSQL: postgresql://user:pass@host/db");
     mvwprintw(popup, 8, 2, "SQL Query (Ctrl+E to execute, ESC to cancel):");
-
     curs_set(1);
     keypad(popup, TRUE);
-
     mvwprintw(popup, 2, 44, ">");
     wrefresh(popup);
-
     int db_choice = wgetch(popup);
     char db_type[32] = "sqlite";
-
     if (db_choice == '2') {
         strcpy(db_type, "postgres");
         mvwprintw(popup, 2, 46, "PostgreSQL");
@@ -1162,14 +1143,11 @@ void prompt_sql_query(ViewerState *state) {
         mvwprintw(popup, 2, 46, "SQLite");
     }
     wrefresh(popup);
-
     mvwprintw(popup, 4, 14, ">");
     wmove(popup, 4, 16);
     wrefresh(popup);
-
     char connection[512] = {0};
     int conn_pos = 0;
-
     while (1) {
         int ch = wgetch(popup);
         if (ch == '\n' || ch == KEY_ENTER) break;
@@ -1195,18 +1173,10 @@ void prompt_sql_query(ViewerState *state) {
             wrefresh(popup);
         }
     }
-
     #define MAX_SQL_LINES 12
     char lines[MAX_SQL_LINES][256];
-    for (int i = 0; i < MAX_SQL_LINES; i++) {
-        lines[i][0] = '\0';
-    }
-
-    int current_line = 0;
-    int pos = 0;
-    int scroll_offset = 0;
-    int visible_lines = 12;
-
+    for (int i = 0; i < MAX_SQL_LINES; i++) lines[i][0] = '\0';
+    int current_line = 0, pos = 0, scroll_offset = 0, visible_lines = 12;
     for (int i = 0; i < visible_lines; i++) {
         int y = 10 + i;
         mvwhline(popup, y, 2, ' ', popup_width - 3);
@@ -1214,29 +1184,21 @@ void prompt_sql_query(ViewerState *state) {
     }
     wmove(popup, 10, 4);
     wrefresh(popup);
-
     while (1) {
         int ch = wgetch(popup);
-
-        if (ch == 5) {
-            break;
-        } else if (ch == '\n' || ch == KEY_ENTER) {
+        if (ch == 5) break;
+        else if (ch == '\n' || ch == KEY_ENTER) {
             if (current_line < MAX_SQL_LINES - 1) {
                 current_line++;
                 pos = strlen(lines[current_line]);
-                if (current_line - scroll_offset >= visible_lines) {
-                    scroll_offset++;
-                }
-
+                if (current_line - scroll_offset >= visible_lines) scroll_offset++;
                 for (int i = 0; i < visible_lines; i++) {
                     int line_idx = scroll_offset + i;
                     int y = 10 + i;
                     mvwhline(popup, y, 2, ' ', popup_width - 3);
                     if (line_idx < MAX_SQL_LINES) {
                         mvwprintw(popup, y, 2, ">");
-                        if (lines[line_idx][0] != '\0') {
-                            mvwprintw(popup, y, 4, "%s", lines[line_idx]);
-                        }
+                        if (lines[line_idx][0] != '\0') mvwprintw(popup, y, 4, "%s", lines[line_idx]);
                     }
                 }
                 wmove(popup, 10 + (current_line - scroll_offset), 4 + pos);
@@ -1257,48 +1219,39 @@ void prompt_sql_query(ViewerState *state) {
                 pos = strlen(lines[current_line]);
                 if (current_line < scroll_offset) scroll_offset--;
             }
-
             for (int i = 0; i < visible_lines; i++) {
                 int line_idx = scroll_offset + i;
                 int y = 10 + i;
                 mvwhline(popup, y, 2, ' ', popup_width - 3);
                 if (line_idx < MAX_SQL_LINES) {
                     mvwprintw(popup, y, 2, ">");
-                    if (lines[line_idx][0] != '\0') {
-                        mvwprintw(popup, y, 4, "%s", lines[line_idx]);
-                    }
+                    if (lines[line_idx][0] != '\0') mvwprintw(popup, y, 4, "%s", lines[line_idx]);
                 }
             }
             wmove(popup, 10 + (current_line - scroll_offset), 4 + pos);
             wrefresh(popup);
-        } else if (isprint(ch) && pos < 250) {
+        } else if (isprint(ch) && pos < 254) {
             lines[current_line][pos++] = ch;
             lines[current_line][pos] = '\0';
             mvwprintw(popup, 10 + (current_line - scroll_offset), 4, "%s", lines[current_line]);
             wrefresh(popup);
         }
     }
-
     curs_set(0);
     delwin(popup);
     touchwin(stdscr);
     refresh();
-
     char query[2048] = {0};
     for (int i = 0; i < MAX_SQL_LINES; i++) {
         char *line = lines[i];
         while (*line && isspace((unsigned char)*line)) line++;
         if (*line == '\0') continue;
-
         int len = strlen(line);
         while (len > 0 && isspace((unsigned char)line[len-1])) line[--len] = '\0';
-
         if (query[0] != '\0') strncat(query, " ", sizeof(query) - strlen(query) - 1);
         strncat(query, line, sizeof(query) - strlen(query) - 1);
     }
-
     if (query[0] == '\0' || connection[0] == '\0') return;
-
     if (state->buffer_count < MAX_BUFFERS) {
         if (load_sql_response(&state->buffers[state->buffer_count], db_type, connection, query) == 0) {
             state->current_buffer = state->buffer_count;
@@ -1314,51 +1267,36 @@ void prompt_sql_query(ViewerState *state) {
     }
 }
 
-// --- URL input popup --------------------------------------------------------
-
-void prompt_url(ViewerState *state, const char *tool_name,
-                int (*loader_func)(Buffer*, const char*)) {
+void prompt_url(ViewerState *state, const char *tool_name, int (*loader_func)(Buffer*, const char*)) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
-
     int popup_height = 10;
     int popup_width = 70;
     int start_y = (max_y - popup_height) / 2;
     int start_x = (max_x - popup_width) / 2;
-
     WINDOW *popup = newwin(popup_height, popup_width, start_y, start_x);
     if (!popup) return;
-
     box(popup, 0, 0);
-
     wattron(popup, A_BOLD);
     char title[64];
     snprintf(title, sizeof(title), " %s URL Fetch ", tool_name);
     mvwprintw(popup, 0, 2, "%s", title);
     wattroff(popup, A_BOLD);
-
     mvwprintw(popup, 2, 2, "Examples:");
     mvwprintw(popup, 3, 4, "https://example.com");
     mvwprintw(popup, 4, 4, "http://httpbin.org/get");
-
     mvwprintw(popup, 6, 2, "Enter URL (Enter to fetch, ESC to cancel):");
     mvwprintw(popup, 8, 2, ">");
-
     curs_set(1);
     keypad(popup, TRUE);
-
     char input[512] = {0};
     int pos = 0;
-
     wmove(popup, 8, 4);
     wrefresh(popup);
-
     while (1) {
         int ch = wgetch(popup);
-
-        if (ch == '\n' || ch == KEY_ENTER) {
-            break;
-        } else if (ch == 27) {
+        if (ch == '\n' || ch == KEY_ENTER) break;
+        else if (ch == 27) {
             curs_set(0);
             delwin(popup);
             touchwin(stdscr);
@@ -1380,19 +1318,15 @@ void prompt_url(ViewerState *state, const char *tool_name,
             wrefresh(popup);
         }
     }
-
     curs_set(0);
     delwin(popup);
     touchwin(stdscr);
     refresh();
-
     char *url = input;
     while (*url && isspace((unsigned char)*url)) url++;
     if (*url == '\0') return;
-
     int len = strlen(url);
     while (len > 0 && isspace((unsigned char)url[len-1])) url[--len] = '\0';
-
     if (state->buffer_count < MAX_BUFFERS) {
         if (loader_func(&state->buffers[state->buffer_count], url) == 0) {
             state->current_buffer = state->buffer_count;
@@ -1405,13 +1339,6 @@ void prompt_url(ViewerState *state, const char *tool_name,
             refresh();
             napms(1500);
         }
-    } else {
-        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-        mvhline(max_y - 2, 0, ' ', max_x);
-        mvprintw(max_y - 2, 1, "Maximum buffer limit reached");
-        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-        refresh();
-        napms(1500);
     }
 }
 
@@ -1421,83 +1348,51 @@ static void http_popup_redraw_lines(WINDOW *popup, char lines[][256], int max_li
     for (int i = 0; i < visible_lines; i++) {
         int line_idx = scroll_offset + i;
         int y = 9 + i;
-
         mvwhline(popup, y, 2, ' ', popup_width - 3);
-
         if (line_idx < max_lines) {
             mvwprintw(popup, y, 2, ">");
-            if (lines[line_idx][0] != '\0') {
-                mvwprintw(popup, y, 4, "%s", lines[line_idx]);
-            }
+            if (lines[line_idx][0] != '\0') mvwprintw(popup, y, 4, "%s", lines[line_idx]);
         }
     }
-
     int cursor_y = 9 + (current_line - scroll_offset);
-    if (cursor_y >= 9 && cursor_y < 9 + visible_lines) {
-        wmove(popup, cursor_y, 4 + pos);
-    }
-
+    if (cursor_y >= 9 && cursor_y < 9 + visible_lines) wmove(popup, cursor_y, 4 + pos);
     wrefresh(popup);
 }
 
 void prompt_http_request(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
-
     int popup_height = 20;
     int popup_width = 70;
     int start_y = (max_y - popup_height) / 2;
     int start_x = (max_x - popup_width) / 2;
-
     WINDOW *popup = newwin(popup_height, popup_width, start_y, start_x);
     if (!popup) return;
-
     box(popup, 0, 0);
-
     wattron(popup, A_BOLD);
     mvwprintw(popup, 0, 2, " HTTP Request ");
     wattroff(popup, A_BOLD);
-
     mvwprintw(popup, 2, 2, "Examples:");
     mvwprintw(popup, 3, 4, "GET httpbin.org/get");
     mvwprintw(popup, 4, 4, "POST httpbin.org/post name=John age:=30");
     mvwprintw(popup, 5, 4, "GET api.example.com Auth:\"Bearer token\"");
-
     mvwprintw(popup, 7, 2, "Enter request (Ctrl+E to execute, ESC to cancel):");
-
     #define MAX_REQUEST_LINES 10
     char lines[MAX_REQUEST_LINES][256];
-    for (int i = 0; i < MAX_REQUEST_LINES; i++) {
-        lines[i][0] = '\0';
-    }
-
-    int current_line = 0;
-    int pos = 0;
-    int scroll_offset = 0;
-    int visible_lines = 9;
-
+    for (int i = 0; i < MAX_REQUEST_LINES; i++) lines[i][0] = '\0';
+    int current_line = 0, pos = 0, scroll_offset = 0, visible_lines = 9;
     curs_set(1);
     keypad(popup, TRUE);
-
-    http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
-                             scroll_offset, visible_lines, popup_width);
-
+    http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos, scroll_offset, visible_lines, popup_width);
     while (1) {
         int ch = wgetch(popup);
-
-        if (ch == 5) {
-            break;
-        } else if (ch == '\n' || ch == KEY_ENTER) {
+        if (ch == 5) break;
+        else if (ch == '\n' || ch == KEY_ENTER) {
             if (current_line < MAX_REQUEST_LINES - 1) {
                 current_line++;
                 pos = strlen(lines[current_line]);
-
-                if (current_line - scroll_offset >= visible_lines) {
-                    scroll_offset++;
-                }
-
-                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
-                                         scroll_offset, visible_lines, popup_width);
+                if (current_line - scroll_offset >= visible_lines) scroll_offset++;
+                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos, scroll_offset, visible_lines, popup_width);
             }
         } else if (ch == 27) {
             curs_set(0);
@@ -1509,147 +1404,108 @@ void prompt_http_request(ViewerState *state) {
             if (pos > 0) {
                 pos--;
                 lines[current_line][pos] = '\0';
-                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
-                                         scroll_offset, visible_lines, popup_width);
             } else if (current_line > 0) {
                 current_line--;
                 pos = strlen(lines[current_line]);
-
-                if (current_line < scroll_offset) {
-                    scroll_offset--;
-                }
-
-                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
-                                         scroll_offset, visible_lines, popup_width);
+                if (current_line < scroll_offset) scroll_offset--;
             }
+            http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos, scroll_offset, visible_lines, popup_width);
         } else if (ch == KEY_UP) {
             if (current_line > 0) {
                 current_line--;
                 pos = strlen(lines[current_line]);
-
-                if (current_line < scroll_offset) {
-                    scroll_offset--;
-                }
-
-                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
-                                         scroll_offset, visible_lines, popup_width);
+                if (current_line < scroll_offset) scroll_offset--;
+                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos, scroll_offset, visible_lines, popup_width);
             }
         } else if (ch == KEY_DOWN) {
             if (current_line < MAX_REQUEST_LINES - 1) {
                 current_line++;
                 pos = strlen(lines[current_line]);
-
-                if (current_line - scroll_offset >= visible_lines) {
-                    scroll_offset++;
-                }
-
-                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
-                                         scroll_offset, visible_lines, popup_width);
+                if (current_line - scroll_offset >= visible_lines) scroll_offset++;
+                http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos, scroll_offset, visible_lines, popup_width);
             }
-        } else if (isprint(ch) && pos < 250) {
+        } else if (isprint(ch) && pos < 254) {
             lines[current_line][pos++] = ch;
             lines[current_line][pos] = '\0';
-            http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos,
-                                     scroll_offset, visible_lines, popup_width);
+            http_popup_redraw_lines(popup, lines, MAX_REQUEST_LINES, current_line, pos, scroll_offset, visible_lines, popup_width);
         }
     }
-
     curs_set(0);
     delwin(popup);
     touchwin(stdscr);
     refresh();
-
     char input[2048] = {0};
     for (int i = 0; i < MAX_REQUEST_LINES; i++) {
         char *line = lines[i];
         while (*line && isspace((unsigned char)*line)) line++;
         if (*line == '\0') continue;
-
         int len = strlen(line);
         while (len > 0 && isspace((unsigned char)line[len-1])) line[--len] = '\0';
-
         if (input[0] != '\0') strncat(input, " ", sizeof(input) - strlen(input) - 1);
         strncat(input, line, sizeof(input) - strlen(input) - 1);
     }
-
     int len = (int)strlen(input);
     while (len > 0 && isspace((unsigned char)input[len - 1])) input[--len] = '\0';
-
     if (input[0] == '\0') return;
-
     if (state->buffer_count < MAX_BUFFERS) {
         if (load_http_response(&state->buffers[state->buffer_count], input) == 0) {
             state->current_buffer = state->buffer_count;
             state->buffer_count++;
-        } else {
-            attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-            mvhline(max_y - 2, 0, ' ', max_x);
-            mvprintw(max_y - 2, 1, "Failed to execute HTTP request");
-            attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-            refresh();
-            napms(1500);
         }
-    } else {
-        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-        mvhline(max_y - 2, 0, ' ', max_x);
-        mvprintw(max_y - 2, 1, "Maximum buffer limit reached");
-        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-        refresh();
-        napms(1500);
     }
 }
 
 void reload_http_buffer(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
-
     Buffer *buf = &state->buffers[state->current_buffer];
-
     if (!buf->is_http_buffer || buf->http_request[0] == '\0') {
-        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-        mvhline(max_y - 2, 0, ' ', max_x);
-        mvprintw(max_y - 2, 1, "Current buffer is not an HTTP response");
-        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-        refresh();
-        napms(1500);
+        if (buf->is_active && buf->filepath[0] != '\0' && buf->filepath[0] != '<') {
+            int saved_offset = buf->scroll_offset;
+            if (load_file(buf, buf->filepath) == 0) {
+                buf->scroll_offset = saved_offset;
+                if (buf->scroll_offset >= buf->line_count) buf->scroll_offset = buf->line_count - 1;
+                if (buf->scroll_offset < 0) buf->scroll_offset = 0;
+            }
+        } else {
+            attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+            mvhline(max_y - 2, 0, ' ', max_x);
+            mvprintw(max_y - 2, 1, "Cannot reload this buffer");
+            attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+            refresh();
+            napms(1500);
+        }
         return;
     }
-
     char saved_request[512];
     strncpy(saved_request, buf->http_request, sizeof(saved_request) - 1);
     saved_request[sizeof(saved_request) - 1] = '\0';
-
+    int saved_offset = buf->scroll_offset;
     attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
     mvhline(max_y - 2, 0, ' ', max_x);
-    mvprintw(max_y - 2, 1, "Reloading HTTP request...");
+    mvprintw(max_y - 2, 1, "Reloading...");
     attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
     refresh();
-
     int result = -1;
-    if (strstr(buf->filepath, "[wget:") != NULL) {
+    if (strstr(buf->filepath, "wget") != NULL) {
         result = load_wget_response(buf, saved_request);
-    } else if (strstr(buf->filepath, "[w3m:") != NULL) {
+    } else if (strstr(buf->filepath, "w3m") != NULL) {
         result = load_w3m_response(buf, saved_request);
-    } else if (strstr(buf->filepath, "[RSS:") != NULL) {
+    } else if (strstr(buf->filepath, "RSS") != NULL) {
         result = load_rss_feed(buf, saved_request);
-    }  else {
+    } else {
         result = load_http_response(buf, saved_request);
     }
-
-    if (result != 0) {
-        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-        mvhline(max_y - 2, 0, ' ', max_x);
-        mvprintw(max_y - 2, 1, "Failed to reload HTTP request");
-        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-        refresh();
-        napms(1500);
+    if (result == 0) {
+        buf->scroll_offset = saved_offset;
+        if (buf->scroll_offset >= buf->line_count) buf->scroll_offset = buf->line_count - 1;
+        if (buf->scroll_offset < 0) buf->scroll_offset = 0;
     }
 }
 
 void close_current_buffer(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
-
     if (state->buffer_count <= 1) {
         attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         mvhline(max_y - 2, 0, ' ', max_x);
@@ -1659,33 +1515,27 @@ void close_current_buffer(ViewerState *state) {
         napms(1500);
         return;
     }
-
     int current = state->current_buffer;
-
     free_buffer(&state->buffers[current]);
-
     for (int i = current; i < state->buffer_count - 1; i++) {
         state->buffers[i] = state->buffers[i + 1];
     }
-
     state->buffer_count--;
-
     if (state->current_buffer >= state->buffer_count) {
         state->current_buffer = state->buffer_count - 1;
     }
 }
 
-// --- Search -----------------------------------------------------------------
-
 int search_buffer(ViewerState *state, const char *term, int start_line, int direction) {
     Buffer *buf = &state->buffers[state->current_buffer];
-    if (term[0] == '\0') return -1;
-
+    if (!term || term[0] == '\0') return -1;
+    if (start_line < 0 || start_line >= buf->line_count) start_line = 0;
     int line = start_line;
+    int iterations = 0;
     for (int i = 0; i < buf->line_count; i++) {
+        if (++iterations > buf->line_count) return -1;
         if (line < 0) line = buf->line_count - 1;
         if (line >= buf->line_count) line = 0;
-
         if (strstr(buf->lines[line], term)) return line;
         line += direction;
     }
@@ -1696,48 +1546,40 @@ void find_all_matches(ViewerState *state) {
     Buffer *buf = &state->buffers[state->current_buffer];
     state->search_match_count = 0;
     if (state->search_term[0] == '\0') return;
-
-    for (int i = 0; i < buf->line_count; i++)
-        if (strstr(buf->lines[i], state->search_term)) state->search_match_count++;
+    for (int i = 0; i < buf->line_count; i++) {
+        if (strstr(buf->lines[i], state->search_term)) {
+            if (state->search_match_count < INT_MAX) state->search_match_count++;
+        }
+    }
 }
 
 void prompt_search(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
-
     attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
     mvhline(max_y - 2, 0, ' ', max_x);
     mvprintw(max_y - 2, 1, "Search: ");
     attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-
     move(max_y - 2, 9);
     refresh();
-
     echo();
     curs_set(1);
-
     char input[256] = {0};
     getnstr(input, sizeof(input) - 1);
-
     noecho();
     curs_set(0);
-
     int len = (int)strlen(input);
     while (len > 0 && isspace((unsigned char)input[len - 1])) input[--len] = '\0';
-
     if (input[0] != '\0') {
         strncpy(state->search_term, input, sizeof(state->search_term) - 1);
         state->search_term[sizeof(state->search_term) - 1] = '\0';
         find_all_matches(state);
-
         int match = search_buffer(state, state->search_term, 0, 1);
         if (match >= 0) {
             state->buffers[state->current_buffer].scroll_offset = match;
-
             int count = 0;
             for (int i = 0; i < match; i++)
                 if (strstr(state->buffers[state->current_buffer].lines[i], state->search_term)) count++;
-
             state->current_match = count;
         }
     }
@@ -1767,55 +1609,38 @@ void prev_match(ViewerState *state) {
     }
 }
 
-// --- Copy -------------------------------------------------------------------
-
 void copy_selection_to_clipboard(ViewerState *state) {
     Buffer *buf = &state->buffers[state->current_buffer];
-
     int start = state->copy_start_line;
     int end = state->copy_end_line;
     if (start > end) { int t = start; start = end; end = t; }
-
     FILE *pipe = popen("xclip -selection clipboard 2>/dev/null || pbcopy 2>/dev/null", "w");
     if (!pipe) return;
-
     for (int i = start; i <= end && i < buf->line_count; i++)
         fprintf(pipe, "%s\n", buf->lines[i]);
-
     pclose(pipe);
 }
 
-// --- UI ---------------------------------------------------------------------
-
 void draw_tabbar(ViewerState *state) {
     int max_x = getmaxx(stdscr);
-
     move(0, 0);
     clrtoeol();
-
     attron(COLOR_PAIR(COLOR_TABBAR));
     int x = 1;
     for (int i = 0; i < state->buffer_count; i++) {
         if (!state->buffers[i].is_active) continue;
-
         const char *name = strrchr(state->buffers[i].filepath, '/');
         if (!name) name = state->buffers[i].filepath;
         else name++;
-
         if (i == state->current_buffer) attron(A_REVERSE | A_BOLD);
-
         mvprintw(0, x, " %s ", name);
         x += (int)strlen(name) + 2;
-
         if (i == state->current_buffer) attroff(A_REVERSE | A_BOLD);
-
         if (x < max_x - 1) mvaddch(0, x++, '|');
         if (x >= max_x - 12) break;
     }
-
     mvprintw(0, max_x - 10, " [%d/%d] ", state->current_buffer + 1, state->buffer_count);
     attroff(COLOR_PAIR(COLOR_TABBAR));
-
     attron(COLOR_PAIR(COLOR_NORMAL));
     mvhline(1, 0, ACS_HLINE, max_x);
     attroff(COLOR_PAIR(COLOR_NORMAL));
@@ -1824,54 +1649,40 @@ void draw_tabbar(ViewerState *state) {
 void draw_status_bar(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
-
     Buffer *buf = &state->buffers[state->current_buffer];
-
     attron(COLOR_PAIR(COLOR_NORMAL));
     mvhline(max_y - 2, 0, ACS_HLINE, max_x);
     attroff(COLOR_PAIR(COLOR_NORMAL));
-
     move(max_y - 1, 0);
     clrtoeol();
-
     attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-
     const char *name = strrchr(buf->filepath, '/');
     if (!name) name = buf->filepath;
     else name++;
-
     int percent = buf->line_count > 0 ? (buf->scroll_offset * 100) / buf->line_count : 0;
     const char *mode = state->copy_mode ? "VISUAL" : "NORMAL";
-
     char left[512];
     if (state->wrap_enabled) {
-        snprintf(left, sizeof(left), "NBL Peek | %s | %s | %d%% | %d/%d lines | L:%s W:%s%s",
-                 mode, name, percent,
-                 buf->scroll_offset + 1, buf->line_count,
+        snprintf(left, sizeof(left), "Peek | %s | %s | %d%% | %d/%d | L:%s W:%s%s",
+                 mode, name, percent, buf->scroll_offset + 1, buf->line_count,
                  state->show_line_numbers ? "ON" : "OFF",
                  state->wrap_enabled ? "ON" : "OFF",
                  buf->is_http_buffer ? " | HTTP" : "");
     } else {
-        snprintf(left, sizeof(left), "NBL Peek | %s | %s | %d%% | %d/%d lines | L:%s W:%s | HScroll:%d%s",
-                 mode, name, percent,
-                 buf->scroll_offset + 1, buf->line_count,
+        snprintf(left, sizeof(left), "Peek | %s | %s | %d%% | %d/%d | L:%s W:%s | H:%d%s",
+                 mode, name, percent, buf->scroll_offset + 1, buf->line_count,
                  state->show_line_numbers ? "ON" : "OFF",
                  state->wrap_enabled ? "ON" : "OFF",
                  state->horiz_scroll_offset,
                  buf->is_http_buffer ? " | HTTP" : "");
     }
-
     mvprintw(max_y - 1, 1, "%s", left);
-
     if (state->search_term[0] != '\0') {
         char right[256];
         snprintf(right, sizeof(right), "Search: \"%s\" [%d/%d] ",
-                 state->search_term,
-                 state->current_match + 1,
-                 state->search_match_count);
+                 state->search_term, state->current_match + 1, state->search_match_count);
         mvprintw(max_y - 1, max_x - (int)strlen(right) - 1, "%s", right);
     }
-
     attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
 }
 
@@ -1879,25 +1690,18 @@ void draw_buffer(ViewerState *state) {
     Buffer *buf = &state->buffers[state->current_buffer];
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
-
     int content_start_y = 2;
     int content_height = max_y - 4;
     int line_nr_width = state->show_line_numbers ? 6 : 0;
-
     if (state->wrap_enabled) {
         state->horiz_scroll_offset = 0;
-
         int y = content_start_y;
         int logical_line = buf->scroll_offset;
-
         while (y < content_start_y + content_height && logical_line < buf->line_count) {
             mvhline(y, 0, ' ', max_x);
-
             int text_width = max_x - line_nr_width - 1;
             if (text_width <= 0) text_width = max_x;
-
             WrappedLine wl = wrap_line(buf->lines[logical_line], text_width);
-
             for (int seg = 0; seg < wl.count && y < content_start_y + content_height; seg++) {
                 if (state->show_line_numbers && seg == 0) {
                     attron(COLOR_PAIR(COLOR_LINENR));
@@ -1906,66 +1710,59 @@ void draw_buffer(ViewerState *state) {
                 } else if (state->show_line_numbers) {
                     mvprintw(y, 1, "     ");
                 }
-
                 int a = state->copy_start_line;
                 int b = state->copy_end_line;
                 int lo = (a < b) ? a : b;
                 int hi = (a > b) ? a : b;
-
                 int in_selection = state->copy_mode && logical_line >= lo && logical_line <= hi;
-
                 if (in_selection) attron(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
                 highlight_line(wl.segments[seg], buf->lang, y, line_nr_width + 1, max_x);
                 if (in_selection) attroff(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
-
                 y++;
             }
-
             free_wrapped_line(&wl);
             logical_line++;
         }
-
         while (y < content_start_y + content_height) mvhline(y++, 0, ' ', max_x);
-
     } else {
+        int max_len = 0;
+        for (int i = buf->scroll_offset; i < buf->scroll_offset + content_height && i < buf->line_count; i++) {
+            int len = strlen(buf->lines[i]);
+            if (len > max_len) max_len = len;
+        }
+        int visible_width = max_x - line_nr_width - 1;
+        int max_scroll = max_len - visible_width;
+        if (max_scroll < 0) max_scroll = 0;
+        if (state->horiz_scroll_offset > max_scroll) state->horiz_scroll_offset = max_scroll;
         for (int i = 0; i < content_height; i++) {
             int line_idx = buf->scroll_offset + i;
             int y = content_start_y + i;
-
             mvhline(y, 0, ' ', max_x);
             if (line_idx >= buf->line_count) continue;
-
             if (state->show_line_numbers) {
                 attron(COLOR_PAIR(COLOR_LINENR));
                 mvprintw(y, 1, "%4d ", line_idx + 1);
                 attroff(COLOR_PAIR(COLOR_LINENR));
             }
-
             int a = state->copy_start_line;
             int b = state->copy_end_line;
             int lo = (a < b) ? a : b;
             int hi = (a > b) ? a : b;
-
             int in_selection = state->copy_mode && line_idx >= lo && line_idx <= hi;
-
             const char *line = buf->lines[line_idx];
             int line_len = strlen(line);
-
             int start_col = state->horiz_scroll_offset;
-            if (start_col >= line_len) {
-                continue;
-            }
-
+            if (start_col >= line_len) continue;
             char visible_line[MAX_LINE_LEN];
             strncpy(visible_line, line + start_col, sizeof(visible_line) - 1);
             visible_line[sizeof(visible_line) - 1] = '\0';
-
             if (in_selection) attron(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
             highlight_line(visible_line, buf->lang, y, line_nr_width + 1, max_x);
             if (in_selection) attroff(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
         }
     }
 }
+
 void draw_ui(ViewerState *state) {
     clear();
     draw_tabbar(state);
@@ -1973,33 +1770,29 @@ void draw_ui(ViewerState *state) {
     draw_status_bar(state);
     refresh();
 }
-static void cmd_show_help(void) {
-    int have_nfzf = check_command_exists("ff");
-    int have_fzf  = check_command_exists("fzf");
 
-    if (!have_nfzf && !have_fzf) {
+static void cmd_show_help(void) {
+    int have_ff = check_command_exists("ff");
+    if (!have_ff) {
         int max_y = getmaxy(stdscr);
         int max_x = getmaxx(stdscr);
         attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         mvhline(max_y - 2, 0, ' ', max_x);
-        mvprintw(max_y - 2, 1, "fzf or ff is required for the help menu");
+        mvprintw(max_y - 2, 1, "ff is required for the help menu");
         attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
         refresh();
         napms(1500);
         return;
     }
-
     char help_template[] = "/tmp/peek_help_XXXXXX";
     int fd = mkstemp(help_template);
     if (fd < 0) return;
-
+    register_temp_file(help_template);
     FILE *help_file = fdopen(fd, "w");
     if (!help_file) {
         close(fd);
-        unlink(help_template);
         return;
     }
-
     fprintf(help_file, "=== NAVIGATION ===\n");
     fprintf(help_file, "j / DOWN        | Scroll down one line\n");
     fprintf(help_file, "k / UP          | Scroll up one line\n");
@@ -2010,130 +1803,86 @@ static void cmd_show_help(void) {
     fprintf(help_file, "d / Ctrl+D      | Half page down\n");
     fprintf(help_file, "u / Ctrl+U      | Half page up\n");
     fprintf(help_file, "g               | Jump to top\n");
-    fprintf(help_file, "G               | Jump to bottom\n");
-    fprintf(help_file, "\n");
-
+    fprintf(help_file, "G               | Jump to bottom\n\n");
     fprintf(help_file, "=== SEARCH ===\n");
     fprintf(help_file, "/               | Search forward\n");
     fprintf(help_file, "n               | Next search match\n");
-    fprintf(help_file, "N               | Previous search match\n");
-    fprintf(help_file, "\n");
-
+    fprintf(help_file, "N               | Previous search match\n\n");
     fprintf(help_file, "=== BUFFERS ===\n");
     fprintf(help_file, "Tab             | Next buffer\n");
     fprintf(help_file, "Shift+Tab       | Previous buffer\n");
     fprintf(help_file, "x               | Close current buffer\n");
-    fprintf(help_file, "o               | Open file with fuzzy picker\n");
-    fprintf(help_file, "\n");
-
+    fprintf(help_file, "o               | Open file with ff\n\n");
     fprintf(help_file, "=== HTTP & NETWORK ===\n");
     fprintf(help_file, "r               | Make HTTP request (xh)\n");
-    fprintf(help_file, "R               | Reload current HTTP buffer\n");
+    fprintf(help_file, "R               | Reload current buffer\n");
     fprintf(help_file, "w               | Fetch URL with wget\n");
     fprintf(help_file, "W               | Fetch URL with w3m -dump\n");
-    fprintf(help_file, "f               | Fetch RSS/Atom feed\n");
-    fprintf(help_file, "\n");
-
+    fprintf(help_file, "f               | Fetch RSS/Atom feed\n\n");
     fprintf(help_file, "=== SQL DATABASE ===\n");
-    fprintf(help_file, "s               | Execute SQL query\n");
-    fprintf(help_file, "                | (supports SQLite & PostgreSQL)\n");
-    fprintf(help_file, "\n");
-
+    fprintf(help_file, "s               | Execute SQL query\n\n");
     fprintf(help_file, "=== VISUAL/COPY MODE ===\n");
     fprintf(help_file, "v               | Enter visual/copy mode\n");
     fprintf(help_file, "j/k (in visual) | Extend selection\n");
     fprintf(help_file, "y (in visual)   | Copy selection to clipboard\n");
-    fprintf(help_file, "ESC (in visual) | Exit visual mode\n");
-    fprintf(help_file, "\n");
-
+    fprintf(help_file, "ESC (in visual) | Exit visual mode\n\n");
     fprintf(help_file, "=== SETTINGS ===\n");
     fprintf(help_file, "L               | Toggle line numbers\n");
-    fprintf(help_file, "T               | Toggle line wrapping\n");
-    fprintf(help_file, "\n");
-
+    fprintf(help_file, "T               | Toggle line wrapping\n\n");
     fprintf(help_file, "=== OTHER ===\n");
     fprintf(help_file, "q               | Quit\n");
     fprintf(help_file, "?               | Show this help\n");
-
     fflush(help_file);
     fclose(help_file);
-
+    char *esc_tmp = shell_escape(help_template);
+    if (!esc_tmp) return;
     char cmd[8192];
-    if (have_nfzf) {
-        snprintf(cmd, sizeof(cmd),
-                 "ff < \"%s\" > /dev/null 2>/dev/null",
-                 help_template);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-                 "fzf --height=100%% --layout=reverse --border "
-                 "--header='Peek Help - Search commands (ESC to close)' "
-                 "< \"%s\" > /dev/null 2> /dev/tty",
-                 help_template);
-    }
-
+    snprintf(cmd, sizeof(cmd), "ff < %s > /dev/null 2>/dev/null", esc_tmp);
+    free(esc_tmp);
     def_prog_mode();
     endwin();
     system(cmd);
     reset_prog_mode();
     refresh();
     clear();
-
-    unlink(help_template);
 }
-// --- Input ------------------------------------------------------------------
 
 void handle_input(ViewerState *state, int *running) {
     int ch = getch();
     int max_y = getmaxy(stdscr);
-    int visible_lines = max_y - 3;
-
+    int visible_lines = max_y - 4;
     Buffer *buf = &state->buffers[state->current_buffer];
-
     switch (ch) {
         case '?':
             if (!state->copy_mode) cmd_show_help();
             break;
-
-        case 's':
-        case 'S':
+        case 's': case 'S':
             if (!state->copy_mode) prompt_sql_query(state);
             break;
-
-        case 'q':
-        case 'Q':
+        case 'q': case 'Q':
             if (!state->copy_mode) *running = 0;
             break;
-
         case 27:
             if (state->copy_mode) state->copy_mode = 0;
             break;
-
         case 'r':
             if (!state->copy_mode) prompt_http_request(state);
             break;
-
         case 'R':
             if (!state->copy_mode) reload_http_buffer(state);
             break;
-
-        case 'f':
-        case 'F':
+        case 'f': case 'F':
             if (!state->copy_mode) prompt_url(state, "RSS", load_rss_feed);
             break;
-
         case 'w':
             if (!state->copy_mode) prompt_url(state, "wget", load_wget_response);
             break;
-
         case 'W':
             if (!state->copy_mode) prompt_url(state, "w3m", load_w3m_response);
             break;
-
-        case 'x':
-        case 'X':
+        case 'x': case 'X':
             if (!state->copy_mode) close_current_buffer(state);
             break;
-
         case 'v':
             if (!state->copy_mode) {
                 state->copy_mode = 1;
@@ -2141,37 +1890,26 @@ void handle_input(ViewerState *state, int *running) {
                 state->copy_end_line = buf->scroll_offset;
             }
             break;
-
         case 'y':
             if (state->copy_mode) {
                 copy_selection_to_clipboard(state);
                 state->copy_mode = 0;
             }
             break;
-
-        case 'h':
-        case KEY_LEFT:
+        case 'h': case KEY_LEFT:
             if (!state->wrap_enabled && !state->copy_mode) {
                 state->horiz_scroll_offset -= state->horiz_scroll_step;
-                if (state->horiz_scroll_offset < 0) {
-                    state->horiz_scroll_offset = 0;
-                }
+                if (state->horiz_scroll_offset < 0) state->horiz_scroll_offset = 0;
             }
             break;
-
-        case 'l':
-        case KEY_RIGHT:
+        case 'l': case KEY_RIGHT:
             if (!state->wrap_enabled && !state->copy_mode) {
                 state->horiz_scroll_offset += state->horiz_scroll_step;
             }
             break;
-
         case '0':
-            if (!state->wrap_enabled && !state->copy_mode) {
-                state->horiz_scroll_offset = 0;
-            }
+            if (!state->wrap_enabled && !state->copy_mode) state->horiz_scroll_offset = 0;
             break;
-
         case '$':
             if (!state->wrap_enabled && !state->copy_mode) {
                 int max_len = 0;
@@ -2182,117 +1920,79 @@ void handle_input(ViewerState *state, int *running) {
                 int max_x = getmaxx(stdscr);
                 int line_nr_width = state->show_line_numbers ? 6 : 0;
                 int visible_width = max_x - line_nr_width - 1;
-
                 state->horiz_scroll_offset = max_len - visible_width;
-                if (state->horiz_scroll_offset < 0) {
-                    state->horiz_scroll_offset = 0;
-                }
+                if (state->horiz_scroll_offset < 0) state->horiz_scroll_offset = 0;
             }
             break;
-
         case 'L':
             state->show_line_numbers = !state->show_line_numbers;
             break;
-
-        case 't':
-        case 'T':
+        case 't': case 'T':
             state->wrap_enabled = !state->wrap_enabled;
-            if (state->wrap_enabled) {
-                state->horiz_scroll_offset = 0;
-            }
+            if (state->wrap_enabled) state->horiz_scroll_offset = 0;
             break;
-
         case '/':
             if (!state->copy_mode) prompt_search(state);
             break;
-
         case 'n':
             if (!state->copy_mode) next_match(state);
             break;
-
         case 'N':
             if (!state->copy_mode) prev_match(state);
             break;
-
-        case 'o':
-        case 'O':
+        case 'o': case 'O':
             if (!state->copy_mode) {
                 char filepath[1024] = {0};
-
                 if (pick_file_for_peek(filepath, sizeof(filepath))) {
                     const char *clean_path = filepath;
-                    if (filepath[0] == '.' && filepath[1] == '/') {
-                        clean_path = filepath + 2;
-                    }
-
+                    if (filepath[0] == '.' && filepath[1] == '/') clean_path = filepath + 2;
                     if (state->buffer_count < MAX_BUFFERS) {
                         if (load_file(&state->buffers[state->buffer_count], clean_path) == 0) {
                             state->current_buffer = state->buffer_count;
                             state->buffer_count++;
-                        } else {
-                            int max_y = getmaxy(stdscr);
-                            int max_x = getmaxx(stdscr);
-                            attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-                            mvhline(max_y - 2, 0, ' ', max_x);
-                            mvprintw(max_y - 2, 1, "Failed to load file: %s", clean_path);
-                            attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
-                            refresh();
-                            napms(1500);
                         }
                     }
                 }
-
                 clear();
             }
             break;
-        case 'j':
-        case KEY_DOWN:
+        case 'j': case KEY_DOWN:
             if (buf->scroll_offset < buf->line_count - 1) {
                 buf->scroll_offset++;
                 if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
             }
             break;
-
-        case 'k':
-        case KEY_UP:
+        case 'k': case KEY_UP:
             if (buf->scroll_offset > 0) {
                 buf->scroll_offset--;
                 if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
             }
             break;
-
         case 'g':
             buf->scroll_offset = 0;
             if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
             break;
-
         case 'G':
             buf->scroll_offset = buf->line_count - visible_lines;
             if (buf->scroll_offset < 0) buf->scroll_offset = 0;
             if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
             break;
-
-        case 'd':
-        case 4:
+        case 'd': case 4:
             buf->scroll_offset += visible_lines / 2;
             if (buf->scroll_offset > buf->line_count - visible_lines)
                 buf->scroll_offset = buf->line_count - visible_lines;
             if (buf->scroll_offset < 0) buf->scroll_offset = 0;
             if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
             break;
-
-        case 'u':
-        case 21:
+        case 'u': case 21:
             buf->scroll_offset -= visible_lines / 2;
             if (buf->scroll_offset < 0) buf->scroll_offset = 0;
             if (state->copy_mode) state->copy_end_line = buf->scroll_offset;
             break;
-
         case '\t':
             if (!state->copy_mode && state->buffer_count > 1)
                 state->current_buffer = (state->current_buffer + 1) % state->buffer_count;
             break;
-
         case KEY_BTAB:
             if (!state->copy_mode && state->buffer_count > 1) {
                 state->current_buffer--;
@@ -2301,27 +2001,24 @@ void handle_input(ViewerState *state, int *running) {
             break;
     }
 }
-// --- main -------------------------------------------------------------------
 
 int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
-
     ViewerState *state = calloc(1, sizeof(ViewerState));
     if (!state) {
         fprintf(stderr, "Failed to allocate memory\n");
         return 1;
     }
-
+    g_state = state;
+    setup_signal_handlers();
     state->show_line_numbers = 1;
     state->wrap_enabled = 1;
     state->copy_mode = 0;
     state->horiz_scroll_offset = 0;
     state->horiz_scroll_step = 8;
-
     int stdin_is_pipe = !isatty(STDIN_FILENO);
     int loaded_anything = 0;
     int arg_start = 1;
-
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--no-wrap") == 0) {
             state->wrap_enabled = 0;
@@ -2334,9 +2031,7 @@ int main(int argc, char *argv[]) {
             break;
         }
     }
-
     int effective_argc = argc - (arg_start - 1);
-
     if (effective_argc < 2) {
         if (!stdin_is_pipe) {
             usage(argv[0]);
@@ -2353,137 +2048,103 @@ int main(int argc, char *argv[]) {
         }
     } else {
         for (int i = arg_start; i < argc && state->buffer_count < MAX_BUFFERS; i++) {
-
             if (strcmp(argv[i], "-m") == 0) {
                 if (i + 1 >= argc) {
                     fprintf(stderr, "peek: -m requires a command string\n");
                     usage(argv[0]);
                     break;
                 }
-
                 const char *cmd = argv[++i];
                 char label[1024];
                 snprintf(label, sizeof(label), "[%s]", cmd);
-
                 if (is_man_command_arg(cmd)) {
                     char cmd2[2048];
                     build_man_cmd_plain(cmd2, sizeof(cmd2), cmd);
                     if (load_command(&state->buffers[state->buffer_count], label, cmd2, LANG_MAN) == 0) {
                         state->buffer_count++;
                         loaded_anything = 1;
-                    } else {
-                        fprintf(stderr, "peek: failed to run command: %s\n", cmd);
                     }
                 } else {
                     if (load_command(&state->buffers[state->buffer_count], label, cmd, LANG_NONE) == 0) {
                         state->buffer_count++;
                         loaded_anything = 1;
-                    } else {
-                        fprintf(stderr, "peek: failed to run command: %s\n", cmd);
                     }
                 }
                 continue;
             }
-
             if (strcmp(argv[i], "-") == 0) {
                 if (load_stdin(&state->buffers[state->buffer_count]) == 0) {
                     state->buffer_count++;
                     loaded_anything = 1;
-                } else {
-                    fprintf(stderr, "Failed to read stdin\n");
                 }
                 continue;
             }
-
             if (is_man_command_arg(argv[i])) {
                 const char *cmd = argv[i];
                 char label[1024];
                 snprintf(label, sizeof(label), "[%s]", cmd);
-
                 char cmd2[2048];
                 build_man_cmd_plain(cmd2, sizeof(cmd2), cmd);
-
                 if (load_command(&state->buffers[state->buffer_count], label, cmd2, LANG_MAN) == 0) {
                     state->buffer_count++;
                     loaded_anything = 1;
-                } else {
-                    fprintf(stderr, "peek: failed to run man command: %s\n", cmd);
                 }
                 continue;
             }
-
             if (load_file(&state->buffers[state->buffer_count], argv[i]) == 0) {
                 state->buffer_count++;
                 loaded_anything = 1;
-            } else {
-                fprintf(stderr, "Failed to load %s\n", argv[i]);
             }
         }
     }
-
     if (!loaded_anything || state->buffer_count == 0) {
         fprintf(stderr, "Failed to load any files/stdin\n");
         free(state);
         return 1;
     }
-
-    FILE *tty_in = NULL;
-    SCREEN *screen = NULL;
-
     if (stdin_is_pipe) {
-        tty_in = fopen("/dev/tty", "r");
-        if (!tty_in) {
-            fprintf(stderr, "Failed to open /dev/tty for input: %s\n", strerror(errno));
+        g_tty_in = fopen("/dev/tty", "r");
+        if (!g_tty_in) {
+            fprintf(stderr, "Failed to open /dev/tty: %s\n", strerror(errno));
             free(state);
             return 1;
         }
-
-        screen = newterm(NULL, stdout, tty_in);
-        if (!screen) {
+        g_screen = newterm(NULL, stdout, g_tty_in);
+        if (!g_screen) {
             fprintf(stderr, "newterm() failed\n");
-            fclose(tty_in);
+            fclose(g_tty_in);
             free(state);
             return 1;
         }
-        set_term(screen);
+        set_term(g_screen);
     } else {
         initscr();
     }
-
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
-
     if (has_colors()) {
         start_color();
         use_default_colors();
-
-        init_pair(COLOR_NORMAL,  COLOR_WHITE,  -1);
-        init_pair(COLOR_KEYWORD, COLOR_MAGENTA,-1);
-        init_pair(COLOR_STRING,  COLOR_GREEN,  -1);
-        init_pair(COLOR_COMMENT, COLOR_CYAN,   -1);
-        init_pair(COLOR_NUMBER,  COLOR_YELLOW, -1);
-        init_pair(COLOR_TYPE,    COLOR_BLUE,   -1);
-        init_pair(COLOR_FUNCTION,COLOR_YELLOW, -1);
-        init_pair(COLOR_TABBAR,  COLOR_WHITE,  -1);
-        init_pair(COLOR_STATUS,  COLOR_WHITE,  -1);
-        init_pair(COLOR_LINENR,  COLOR_YELLOW, -1);
+        init_pair(COLOR_NORMAL, COLOR_WHITE, -1);
+        init_pair(COLOR_KEYWORD, COLOR_MAGENTA, -1);
+        init_pair(COLOR_STRING, COLOR_GREEN, -1);
+        init_pair(COLOR_COMMENT, COLOR_CYAN, -1);
+        init_pair(COLOR_NUMBER, COLOR_YELLOW, -1);
+        init_pair(COLOR_TYPE, COLOR_BLUE, -1);
+        init_pair(COLOR_FUNCTION, COLOR_YELLOW, -1);
+        init_pair(COLOR_TABBAR, COLOR_WHITE, -1);
+        init_pair(COLOR_STATUS, COLOR_WHITE, -1);
+        init_pair(COLOR_LINENR, COLOR_YELLOW, -1);
         init_pair(COLOR_COPY_SELECT, COLOR_WHITE, COLOR_BLUE);
     }
-
     int running = 1;
     while (running) {
         draw_ui(state);
         handle_input(state, &running);
     }
-
-    for (int i = 0; i < state->buffer_count; i++) free_buffer(&state->buffers[i]);
-
-    endwin();
-    if (screen) delscreen(screen);
-    if (tty_in) fclose(tty_in);
-
+    cleanup_terminal();
     free(state);
     return 0;
 }
