@@ -5,7 +5,8 @@ static SCREEN *g_screen = NULL;
 static FILE *g_tty_in = NULL;
 static char *g_temp_files[10] = {NULL};
 static int g_temp_file_count = 0;
-
+static FILE *g_dbg = NULL;
+#define DBG(fmt, ...) do { if(g_dbg){fprintf(g_dbg, fmt "\n", ##__VA_ARGS__);fflush(g_dbg);} } while(0)
 // Register temp file for cleanup
 static void register_temp_file(const char *path) {
     if (g_temp_file_count < 10 && path) {
@@ -235,12 +236,12 @@ Language detect_language(const char *filepath) {
     if (!filepath) return LANG_NONE;
     const char *ext = strrchr(filepath, '.');
     if (!ext) {
-        if (strstr(filepath, "/man/") || strstr(filepath, ".man")) 
+        if (strstr(filepath, "/man/") || strstr(filepath, ".man"))
             return LANG_MAN;
         return LANG_NONE;
     }
     if (strcmp(ext, ".c") == 0 || strcmp(ext, ".h") == 0) return LANG_C;
-    if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 || 
+    if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 ||
         strcmp(ext, ".hpp") == 0 || strcmp(ext, ".cxx") == 0) return LANG_CPP;
     if (strcmp(ext, ".py") == 0) return LANG_PYTHON;
     if (strcmp(ext, ".java") == 0) return LANG_JAVA;
@@ -248,7 +249,7 @@ Language detect_language(const char *filepath) {
     if (strcmp(ext, ".ts") == 0 || strcmp(ext, ".tsx") == 0) return LANG_TS;
     if (strcmp(ext, ".html") == 0 || strcmp(ext, ".htm") == 0) return LANG_HTML;
     if (strcmp(ext, ".css") == 0) return LANG_CSS;
-    if (strcmp(ext, ".sh") == 0 || strcmp(ext, ".bash") == 0 || 
+    if (strcmp(ext, ".sh") == 0 || strcmp(ext, ".bash") == 0 ||
         strcmp(ext, ".zsh") == 0) return LANG_SHELL;
     if (strcmp(ext, ".md") == 0 || strcmp(ext, ".markdown") == 0) return LANG_MARKDOWN;
     if (strcmp(ext, ".rs") == 0) return LANG_RUST;
@@ -562,7 +563,7 @@ static int is_pdf_url(const char *url) {
     if (len < 4) return 0;
     const char *ext = url + len - 4;
     if (strcasecmp(ext, ".pdf") == 0) return 1;
-    
+
     // Check for .pdf? or .PDF? (case-insensitive search)
     for (const char *p = url; *p; p++) {
         if ((p[0] == '.' || p[0] == '.') &&
@@ -583,62 +584,6 @@ static int is_pdf_file(const char *filepath) {
     return (strcasecmp(ext, ".pdf") == 0);
 }
 
-int load_file(Buffer *buf, const char *filepath) {
-    if (is_pdf_file(filepath)) {
-        int have_pdftotext = cmd_exists("pdftotext");
-        if (have_pdftotext) {
-            buf->line_count = 0;
-            buf->scroll_offset = 0;
-            strncpy(buf->filepath, filepath, sizeof(buf->filepath) - 1);
-            buf->filepath[sizeof(buf->filepath) - 1] = '\0';
-            buf->lang = LANG_NONE;
-            buf->is_active = 1;
-            buf->is_http_buffer = 0;
-            buf->http_request[0] = '\0';
-            char *esc = shell_escape(filepath);
-            if (!esc) return -1;
-            char cmd[2048];
-            snprintf(cmd, sizeof(cmd), "pdftotext -layout %s - 2>/dev/null", esc);
-            free(esc);
-            FILE *p = popen(cmd, "r");
-            if (!p) return -1;
-            char line[MAX_LINE_LEN];
-            while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
-                size_t len = strlen(line);
-                while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-                strip_overstrikes(line);
-                strip_ansi(line);
-                rtrim(line);
-                buf->lines[buf->line_count++] = safe_strdup(line);
-            }
-            pclose(p);
-            return (buf->line_count > 0) ? 0 : -1;
-        } else {
-            fprintf(stderr, "Warning: pdftotext not found. Install poppler-utils.\n");
-            return -1;
-        }
-    }
-    FILE *f = fopen(filepath, "r");
-    if (!f) return -1;
-    buf->line_count = 0;
-    buf->scroll_offset = 0;
-    strncpy(buf->filepath, filepath, sizeof(buf->filepath) - 1);
-    buf->filepath[sizeof(buf->filepath) - 1] = '\0';
-    buf->lang = detect_language(filepath);
-    buf->is_active = 1;
-    buf->is_http_buffer = 0;
-    buf->http_request[0] = '\0';
-    char line[MAX_LINE_LEN];
-    while (fgets(line, sizeof(line), f) && buf->line_count < MAX_LINES) {
-        line[strcspn(line, "\n")] = 0;
-        strip_overstrikes(line);
-        strip_ansi(line);
-        rtrim(line);
-        buf->lines[buf->line_count++] = safe_strdup(line);
-    }
-    fclose(f);
-    return 0;
-}
 
 int load_stdin(Buffer *buf) {
     buf->line_count = 0;
@@ -690,7 +635,7 @@ static int pick_file_for_peek(char *out, size_t out_len) {
     register_temp_file(tmp_template);
     int has_fd = check_command_exists("fd");
     char cmd[8192];
-    const char *find_cmd = has_fd ? 
+    const char *find_cmd = has_fd ?
         "fd -L -t f . --exclude .git --exclude node_modules --exclude build --exclude dist --exclude .cache 2>/dev/null" :
         "find . -type f 2>/dev/null";
     char *esc_cwd = shell_escape(cwd);
@@ -1455,54 +1400,251 @@ void prompt_http_request(ViewerState *state) {
     }
 }
 
+/* Drop-in replacements for the affected functions in peek.c */
+
+/* Add this helper near free_buffer: */
+static void clear_buffer_lines(Buffer *buf) {
+    for (int i = 0; i < buf->line_count; i++) {
+        if (buf->lines[i]) {
+            free(buf->lines[i]);
+            buf->lines[i] = NULL;
+        }
+    }
+    buf->line_count = 0;
+}
+
+/*
+ * All load_* functions must call clear_buffer_lines(buf) at the top
+ * before setting line_count = 0, otherwise old pointers leak / corrupt.
+ *
+ * The key fix: load_file was not freeing old lines on reload.
+ */
+int load_file(Buffer *buf, const char *filepath) {
+    /* FREE OLD LINES FIRST */
+    clear_buffer_lines(buf);
+
+    if (is_pdf_file(filepath)) {
+        int have_pdftotext = cmd_exists("pdftotext");
+        if (have_pdftotext) {
+            buf->scroll_offset = 0;
+            strncpy(buf->filepath, filepath, sizeof(buf->filepath) - 1);
+            buf->filepath[sizeof(buf->filepath) - 1] = '\0';
+            buf->lang = LANG_NONE;
+            buf->is_active = 1;
+            buf->is_http_buffer = 0;
+            buf->http_request[0] = '\0';
+            char *esc = shell_escape(filepath);
+            if (!esc) return -1;
+            char cmd[2048];
+            snprintf(cmd, sizeof(cmd), "pdftotext -layout %s - 2>/dev/null", esc);
+            free(esc);
+            FILE *p = popen(cmd, "r");
+            if (!p) return -1;
+            char line[MAX_LINE_LEN];
+            while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
+                size_t len = strlen(line);
+                while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+                strip_overstrikes(line); strip_ansi(line); rtrim(line);
+                buf->lines[buf->line_count++] = safe_strdup(line);
+            }
+            pclose(p);
+            return (buf->line_count > 0) ? 0 : -1;
+        }
+        fprintf(stderr, "Warning: pdftotext not found.\n");
+        return -1;
+    }
+
+    FILE *f = fopen(filepath, "r");
+    if (!f) return -1;
+    buf->scroll_offset = 0;
+    strncpy(buf->filepath, filepath, sizeof(buf->filepath) - 1);
+    buf->filepath[sizeof(buf->filepath) - 1] = '\0';
+    buf->lang = detect_language(filepath);
+    buf->is_active = 1;
+    buf->is_http_buffer = 0;
+    buf->http_request[0] = '\0';
+    char line[MAX_LINE_LEN];
+    while (fgets(line, sizeof(line), f) && buf->line_count < MAX_LINES) {
+        line[strcspn(line, "\n")] = 0;
+        strip_overstrikes(line); strip_ansi(line); rtrim(line);
+        buf->lines[buf->line_count++] = safe_strdup(line);
+    }
+    fclose(f);
+    return 0;
+}
+
+/*
+ * Fixed reload_http_buffer:
+ *
+ * Problems in the original:
+ *   1. For non-HTTP file buffers, called load_file() which didn't free old lines.
+ *   2. For HTTP buffers, used strstr() on filepath to detect loader type —
+ *      fragile because filepath is a label like "wget: https://..." which
+ *      happens to work, but "RSS: ..." vs "HTTP: ..." is implicit.
+ *   3. Never frees old lines before reloading HTTP buffers either — the
+ *      individual load_http_response etc. also set line_count=0 without freeing.
+ *
+ * Fix: use buf->is_http_buffer + a stored enum/tag for the loader type,
+ * OR (simpler, no struct change) inspect the filepath prefix reliably.
+ * We prefix-match on the label we ourselves wrote, which is deterministic.
+ */
+/*
+ * Replace reload_http_buffer with this debug version temporarily.
+ * It writes to /tmp/peek_debug.log at each step so you can see
+ * exactly where it dies before the trace trap.
+ *
+ * Add this near the top of the file (after includes):
+ *   static FILE *g_dbg = NULL;
+ *   #define DBG(fmt, ...) do { if(g_dbg){fprintf(g_dbg, fmt "\n", ##__VA_ARGS__);fflush(g_dbg);} } while(0)
+ *
+ * In main(), before the event loop, add:
+ *   g_dbg = fopen("/tmp/peek_debug.log", "w");
+ */
+
 void reload_http_buffer(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
     Buffer *buf = &state->buffers[state->current_buffer];
-    if (!buf->is_http_buffer || buf->http_request[0] == '\0') {
-        if (buf->is_active && buf->filepath[0] != '\0' && buf->filepath[0] != '<') {
-            int saved_offset = buf->scroll_offset;
-            if (load_file(buf, buf->filepath) == 0) {
-                buf->scroll_offset = saved_offset;
-                if (buf->scroll_offset >= buf->line_count) buf->scroll_offset = buf->line_count - 1;
-                if (buf->scroll_offset < 0) buf->scroll_offset = 0;
-            }
-        } else {
+
+    DBG("reload: is_http=%d filepath='%s' line_count=%d scroll=%d",
+        buf->is_http_buffer, buf->filepath, buf->line_count, buf->scroll_offset);
+
+    if (!buf->is_http_buffer) {
+        if (buf->filepath[0] == '\0' || buf->filepath[0] == '<') {
+            DBG("reload: stdin buffer, refusing");
             attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
             mvhline(max_y - 2, 0, ' ', max_x);
-            mvprintw(max_y - 2, 1, "Cannot reload this buffer");
+            mvprintw(max_y - 2, 1, "Cannot reload stdin buffer");
+            attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+            refresh();
+            napms(1500);
+            return;
+        }
+
+        /* Save what we need before touching the buffer */
+        char filepath_copy[sizeof(buf->filepath)];
+        strncpy(filepath_copy, buf->filepath, sizeof(filepath_copy) - 1);
+        filepath_copy[sizeof(filepath_copy) - 1] = '\0';
+        int saved_offset = buf->scroll_offset;
+
+        DBG("reload: freeing %d old lines", buf->line_count);
+
+        /* Free old lines */
+        for (int i = 0; i < buf->line_count; i++) {
+            if (buf->lines[i]) {
+                free(buf->lines[i]);
+                buf->lines[i] = NULL;
+            }
+        }
+        buf->line_count = 0;
+
+        DBG("reload: calling load_file on '%s'", filepath_copy);
+
+        int rc = load_file(buf, filepath_copy);
+
+        DBG("reload: load_file returned %d, new line_count=%d", rc, buf->line_count);
+
+        if (rc == 0) {
+            buf->scroll_offset = saved_offset;
+            if (buf->line_count == 0) {
+                buf->scroll_offset = 0;
+            } else if (buf->scroll_offset >= buf->line_count) {
+                buf->scroll_offset = buf->line_count - 1;
+            }
+            if (buf->scroll_offset < 0) buf->scroll_offset = 0;
+            DBG("reload: success, scroll_offset=%d", buf->scroll_offset);
+        } else {
+            DBG("reload: load_file failed");
+            attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+            mvhline(max_y - 2, 0, ' ', max_x);
+            mvprintw(max_y - 2, 1, "Reload failed: %s", filepath_copy);
             attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
             refresh();
             napms(1500);
         }
+
+        DBG("reload: done, returning to event loop");
         return;
     }
-    char saved_request[512];
+
+    /* HTTP buffer reload */
+    if (buf->http_request[0] == '\0') {
+        DBG("reload: http buffer but no request stored");
+        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        mvhline(max_y - 2, 0, ' ', max_x);
+        mvprintw(max_y - 2, 1, "No request stored for this buffer");
+        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        refresh();
+        napms(1500);
+        return;
+    }
+
+    char saved_request[sizeof(buf->http_request)];
     strncpy(saved_request, buf->http_request, sizeof(saved_request) - 1);
     saved_request[sizeof(saved_request) - 1] = '\0';
+
+    char saved_filepath[sizeof(buf->filepath)];
+    strncpy(saved_filepath, buf->filepath, sizeof(saved_filepath) - 1);
+    saved_filepath[sizeof(saved_filepath) - 1] = '\0';
+
     int saved_offset = buf->scroll_offset;
+
+    DBG("reload: http buffer, filepath='%s' request='%s'", saved_filepath, saved_request);
+
     attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
     mvhline(max_y - 2, 0, ' ', max_x);
     mvprintw(max_y - 2, 1, "Reloading...");
     attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
     refresh();
-    int result = -1;
-    if (strstr(buf->filepath, "wget") != NULL) {
-        result = load_wget_response(buf, saved_request);
-    } else if (strstr(buf->filepath, "w3m") != NULL) {
-        result = load_w3m_response(buf, saved_request);
-    } else if (strstr(buf->filepath, "RSS") != NULL) {
-        result = load_rss_feed(buf, saved_request);
-    } else {
-        result = load_http_response(buf, saved_request);
+
+    /* Free old lines */
+    for (int i = 0; i < buf->line_count; i++) {
+        if (buf->lines[i]) { free(buf->lines[i]); buf->lines[i] = NULL; }
     }
+    buf->line_count = 0;
+
+    int result = -1;
+    if (strncmp(saved_filepath, "wget", 4) == 0) {
+        DBG("reload: using wget loader");
+        result = load_wget_response(buf, saved_request);
+    } else if (strncmp(saved_filepath, "w3m", 3) == 0) {
+        DBG("reload: using w3m loader");
+        result = load_w3m_response(buf, saved_request);
+    } else if (strncmp(saved_filepath, "RSS:", 4) == 0) {
+        DBG("reload: using rss loader");
+        result = load_rss_feed(buf, saved_request);
+    } else if (strncmp(saved_filepath, "HTTP:", 5) == 0) {
+        DBG("reload: using http loader");
+        result = load_http_response(buf, saved_request);
+    } else {
+        DBG("reload: unknown buffer type '%s'", saved_filepath);
+        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        mvhline(max_y - 2, 0, ' ', max_x);
+        mvprintw(max_y - 2, 1, "Cannot reload: unknown buffer type");
+        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        refresh();
+        napms(1500);
+        return;
+    }
+
+    DBG("reload: http loader returned %d, line_count=%d", result, buf->line_count);
+
     if (result == 0) {
         buf->scroll_offset = saved_offset;
-        if (buf->scroll_offset >= buf->line_count) buf->scroll_offset = buf->line_count - 1;
+        if (buf->line_count == 0) buf->scroll_offset = 0;
+        else if (buf->scroll_offset >= buf->line_count) buf->scroll_offset = buf->line_count - 1;
         if (buf->scroll_offset < 0) buf->scroll_offset = 0;
+    } else {
+        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        mvhline(max_y - 2, 0, ' ', max_x);
+        mvprintw(max_y - 2, 1, "Reload failed");
+        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        refresh();
+        napms(1500);
     }
-}
 
+    DBG("reload: http done");
+}
 void close_current_buffer(ViewerState *state) {
     int max_y = getmaxy(stdscr);
     int max_x = getmaxx(stdscr);
@@ -1663,7 +1805,7 @@ void draw_status_bar(ViewerState *state) {
     const char *mode = state->copy_mode ? "VISUAL" : "NORMAL";
     char left[512];
     if (state->wrap_enabled) {
-        snprintf(left, sizeof(left), "Peek | %s | %s | %d%% | %d/%d | L:%s W:%s%s",
+        snprintf(left, sizeof(left), "NBL Peek | %s | %s | %d%% | %d/%d | L:%s W:%s%s",
                  mode, name, percent, buf->scroll_offset + 1, buf->line_count,
                  state->show_line_numbers ? "ON" : "OFF",
                  state->wrap_enabled ? "ON" : "OFF",
