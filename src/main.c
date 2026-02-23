@@ -97,7 +97,138 @@ static char* safe_strdup(const char *s) {
     }
     return result;
 }
+typedef struct {
+    int fg;     // -1 default, else 0-255
+    int bg;     // -1 default, else 0-255
+    int bold;
+    int ul;
+    int ital;
+} AnsiState;
 
+static int clamp8(int x) { return (x < 0) ? 0 : (x > 7 ? 7 : x); }
+
+static int map_256_to_curses(int c) {
+    // If terminal supports 256 colors, use it directly.
+    // Otherwise map to 0-7 roughly.
+    if (c < 0) return -1;
+    if (COLORS >= 256) return c;
+    // crude fallback: map to basic 8
+    if (c < 8) return c;
+    if (c >= 8 && c < 16) return (c - 8);
+    return (c % 8);
+}
+
+typedef struct {
+    short fg, bg;
+    short pair_id;
+} PairEnt;
+
+static PairEnt g_pairs[512];
+static int g_pair_count = 0;
+
+static short get_pair_for(short fg, short bg) {
+    // normalize default
+    if (fg < 0) fg = -1;
+    if (bg < 0) bg = -1;
+
+    for (int i = 0; i < g_pair_count; i++) {
+        if (g_pairs[i].fg == fg && g_pairs[i].bg == bg) return g_pairs[i].pair_id;
+    }
+
+    // allocate new pair
+    short next = (short)(g_pair_count + 20); // keep away from your existing pairs 1..11
+    if (next >= COLOR_PAIRS) return 0;
+
+    init_pair(next, fg, bg);
+    g_pairs[g_pair_count++] = (PairEnt){ .fg = fg, .bg = bg, .pair_id = next };
+    return next;
+}
+
+static void ansi_apply(const AnsiState *st) {
+    short fg = (short)map_256_to_curses(st->fg);
+    short bg = (short)map_256_to_curses(st->bg);
+    short pair = get_pair_for(fg, bg);
+
+    attrset(COLOR_PAIR(pair));
+    if (st->bold) attron(A_BOLD);
+    if (st->ul)   attron(A_UNDERLINE);
+#ifdef A_ITALIC
+    if (st->ital) attron(A_ITALIC);
+#endif
+}
+
+static void ansi_reset(AnsiState *st) {
+    st->fg = -1; st->bg = -1;
+    st->bold = st->ul = st->ital = 0;
+}
+
+static void draw_ansi_line(int y, int x, const char *s, int max_x) {
+    AnsiState st;
+    ansi_reset(&st);
+    ansi_apply(&st);
+
+    for (int i = 0; s && s[i] && x < max_x; ) {
+        unsigned char c = (unsigned char)s[i];
+
+        if (c == 0x1B && s[i+1] == '[') {
+            // parse CSI ... m
+            i += 2;
+            int params[16], pn = 0, val = 0, have = 0;
+
+            while (s[i] && pn < 16) {
+                if (isdigit((unsigned char)s[i])) {
+                    val = val * 10 + (s[i] - '0');
+                    have = 1;
+                    i++;
+                } else if (s[i] == ';') {
+                    params[pn++] = have ? val : 0;
+                    val = 0; have = 0;
+                    i++;
+                } else if (s[i] == 'm') {
+                    params[pn++] = have ? val : 0;
+                    i++;
+                    break;
+                } else {
+                    // skip other CSI finals
+                    while (s[i] && s[i] != 'm') i++;
+                    if (s[i] == 'm') i++;
+                    pn = 0;
+                    break;
+                }
+            }
+
+            // apply params
+            if (pn == 0) { ansi_reset(&st); ansi_apply(&st); continue; }
+
+            for (int k = 0; k < pn; k++) {
+                int p = params[k];
+                if (p == 0) ansi_reset(&st);
+                else if (p == 1) st.bold = 1;
+                else if (p == 3) st.ital = 1;
+                else if (p == 4) st.ul   = 1;
+                else if (p == 22) st.bold = 0;
+                else if (p == 23) st.ital = 0;
+                else if (p == 24) st.ul   = 0;
+                else if (p >= 30 && p <= 37) st.fg = clamp8(p - 30);
+                else if (p == 39) st.fg = -1;
+                else if (p >= 40 && p <= 47) st.bg = clamp8(p - 40);
+                else if (p == 49) st.bg = -1;
+                else if (p >= 90 && p <= 97) st.fg = clamp8(p - 90) + 8;
+                else if (p >= 100 && p <= 107) st.bg = clamp8(p - 100) + 8;
+                else if (p == 38 && k + 2 < pn && params[k+1] == 5) { st.fg = params[k+2]; k += 2; }
+                else if (p == 48 && k + 2 < pn && params[k+1] == 5) { st.bg = params[k+2]; k += 2; }
+            }
+            ansi_apply(&st);
+            continue;
+        }
+
+        mvaddch(y, x++, c);
+        i++;
+    }
+
+    // restore something sane after drawing a line
+    attrset(COLOR_PAIR(COLOR_NORMAL));
+}
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
@@ -263,7 +394,127 @@ Language detect_language(const char *filepath) {
     if (strstr(filepath, "/man/") || strstr(filepath, ".man")) return LANG_MAN;
     return LANG_NONE;
 }
+static const char *hl_lang_arg(Language l) {
+    switch (l) {
+        case LANG_C:        return "c";
+        case LANG_CPP:      return "cpp";
+        case LANG_PYTHON:   return "python";
+        case LANG_JAVA:     return "java";
+        case LANG_JS:       return "javascript";
+        case LANG_TS:       return "typescript";
+        case LANG_HTML:     return "html";
+        case LANG_CSS:      return "css";
+        case LANG_SHELL:    return "shell";
+        case LANG_MARKDOWN: return "markdown";
+        case LANG_MAN:      return "man";
+        case LANG_RUST:     return "rust";
+        case LANG_GO:       return "go";
+        case LANG_RUBY:     return "ruby";
+        case LANG_PHP:      return "php";
+        case LANG_SQL:      return "sql";
+        case LANG_JSON:     return "json";
+        case LANG_XML:      return "xml";
+        case LANG_YAML:     return "yaml";
+        default:            return NULL;
+    }
+}
+static void store_line_pair(Buffer *buf, const char *raw_in) {
+    if (!buf || !raw_in || buf->line_count >= MAX_LINES) return;
 
+    int idx = buf->line_count;
+
+    // raw (keep exactly as received; may contain ANSI)
+    buf->raw_lines[idx] = safe_strdup(raw_in);
+
+    // plain (strip overstrikes + ANSI for searching/matching)
+    char tmp[MAX_LINE_LEN];
+    strncpy(tmp, raw_in, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    strip_overstrikes(tmp);
+    rtrim(tmp);
+    strip_ansi(tmp);
+
+    buf->lines[idx] = safe_strdup(tmp);
+
+    buf->line_count++;
+}
+static int load_via_highlight_file(Buffer *buf, const char *filepath) {
+    if (!buf || !filepath) return -1;
+    if (!check_command_exists("highlight")) return -1;
+
+    char *esc_path = shell_escape(filepath);
+    if (!esc_path) return -1;
+
+    // Use --path so highlight can autodetect by extension/shebang/sniff.
+    // Feed the file via stdin to keep behavior consistent with your tool.
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+             "highlight --force-color --path %s < %s 2>/dev/null",
+             esc_path, esc_path);
+
+    free(esc_path);
+
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+
+    buf->line_count = 0;
+    buf->has_ansi = 1;
+
+    char line[MAX_LINE_LEN];
+    while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
+        // keep newline off, but KEEP ANSI
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        // don't strip_ansi here
+        rtrim(line);
+        store_line_pair(buf, line);
+    }
+    int rc = pclose(p);
+    (void)rc;
+
+    return (buf->line_count > 0) ? 0 : -1;
+}
+static int load_via_highlight_text(Buffer *buf, Language lang, const char *cmd_that_prints_text) {
+    if (!buf || !cmd_that_prints_text) return -1;
+    if (!check_command_exists("highlight")) return -1;
+
+    const char *hl = hl_lang_arg(lang);
+
+    char *esc_cmd = shell_escape(cmd_that_prints_text);
+    if (!esc_cmd) return -1;
+
+    char cmd[8192];
+    if (hl) {
+        // run your generator command, pipe into highlight forced color
+        snprintf(cmd, sizeof(cmd),
+                 "sh -lc %s | highlight --force-color --lang %s 2>/dev/null",
+                 esc_cmd, hl);
+    } else {
+        // no language hint → just run plain
+        snprintf(cmd, sizeof(cmd),
+                 "sh -lc %s 2>/dev/null",
+                 esc_cmd);
+    }
+    free(esc_cmd);
+
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+
+    buf->line_count = 0;
+    buf->has_ansi = (hl != NULL);
+
+    char line[MAX_LINE_LEN];
+    while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        rtrim(line);
+        store_line_pair(buf, line);
+    }
+    pclose(p);
+
+    return (buf->line_count > 0) ? 0 : -1;
+}
 int is_c_keyword(const char *word) {
     const char *kw[] = {"auto","break","case","char","const","continue","default","do",
         "double","else","enum","extern","float","for","goto","if","int","long","register",
@@ -596,13 +847,15 @@ int load_stdin(Buffer *buf) {
     buf->http_request[0] = '\0';
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), stdin) && buf->line_count < MAX_LINES) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
-        strip_overstrikes(line);
-        strip_ansi(line);
-        rtrim(line);
-        buf->lines[buf->line_count++] = safe_strdup(line);
-    }
+    size_t len = strlen(line);
+    while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+    rtrim(line);
+
+    // Keep raw exactly as received (could include ansi from upstream)
+    // Then create plain via store_line_pair()
+    store_line_pair(buf, line);
+}
+buf->has_ansi = 0;   // unless you decide to run highlight on stdin too
     return buf->line_count > 0 ? 0 : -1;
 }
 
@@ -691,10 +944,9 @@ static int load_command(Buffer *buf, const char *label, const char *cmd, Languag
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-        strip_overstrikes(line);
-        strip_ansi(line);
-        rtrim(line);
-        buf->lines[buf->line_count++] = safe_strdup(line);
+strip_overstrikes(line); // safe to do before storing
+rtrim(line);
+store_line_pair(buf, line);
     }
     pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
@@ -710,16 +962,15 @@ static void build_man_cmd_plain(char *out, size_t outsz, const char *man_cmd) {
 }
 
 void free_buffer(Buffer *buf) {
+    if (!buf) return;
     for (int i = 0; i < buf->line_count; i++) {
-        if (buf->lines[i]) {
-            free(buf->lines[i]);
-            buf->lines[i] = NULL;
-        }
+        free(buf->lines[i]);     buf->lines[i] = NULL;
+        free(buf->raw_lines[i]); buf->raw_lines[i] = NULL;
     }
     buf->line_count = 0;
     buf->is_active = 0;
+    buf->has_ansi = 0;
 }
-
 int load_http_response(Buffer *buf, const char *request_input) {
     for (int i = 0; i < buf->line_count; i++) {
         if (buf->lines[i]) {
@@ -749,10 +1000,9 @@ int load_http_response(Buffer *buf, const char *request_input) {
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-        strip_overstrikes(line);
-        strip_ansi(line);
-        rtrim(line);
-        buf->lines[buf->line_count++] = safe_strdup(line);
+strip_overstrikes(line); // safe to do before storing
+rtrim(line);
+store_line_pair(buf, line);
     }
     pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
@@ -812,10 +1062,9 @@ int load_rss_feed(Buffer *buf, const char *url) {
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-        strip_overstrikes(line);
-        strip_ansi(line);
-        rtrim(line);
-        buf->lines[buf->line_count++] = safe_strdup(line);
+strip_overstrikes(line); // safe to do before storing
+rtrim(line);
+store_line_pair(buf, line);
     }
     pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
@@ -866,10 +1115,9 @@ int load_wget_response(Buffer *buf, const char *url) {
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-        strip_overstrikes(line);
-        strip_ansi(line);
-        rtrim(line);
-        buf->lines[buf->line_count++] = safe_strdup(line);
+strip_overstrikes(line); // safe to do before storing
+rtrim(line);
+store_line_pair(buf, line);
     }
     pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
@@ -920,10 +1168,9 @@ int load_w3m_response(Buffer *buf, const char *url) {
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-        strip_overstrikes(line);
-        strip_ansi(line);
-        rtrim(line);
-        buf->lines[buf->line_count++] = safe_strdup(line);
+strip_overstrikes(line); // safe to do before storing
+rtrim(line);
+store_line_pair(buf, line);
     }
     pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
@@ -1047,10 +1294,9 @@ int load_sql_response(Buffer *buf, const char *db_type, const char *connection, 
     while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-        strip_overstrikes(line);
-        strip_ansi(line);
-        rtrim(line);
-        buf->lines[buf->line_count++] = safe_strdup(line);
+strip_overstrikes(line); // safe to do before storing
+rtrim(line);
+store_line_pair(buf, line);
     }
     pclose(p);
     return (buf->line_count > 0) ? 0 : -1;
@@ -1400,62 +1646,53 @@ void prompt_http_request(ViewerState *state) {
     }
 }
 
-/* Drop-in replacements for the affected functions in peek.c */
-
-/* Add this helper near free_buffer: */
 static void clear_buffer_lines(Buffer *buf) {
+    if (!buf) return;
     for (int i = 0; i < buf->line_count; i++) {
-        if (buf->lines[i]) {
-            free(buf->lines[i]);
-            buf->lines[i] = NULL;
-        }
+        free(buf->lines[i]);     buf->lines[i] = NULL;
+        free(buf->raw_lines[i]); buf->raw_lines[i] = NULL;
     }
     buf->line_count = 0;
+    buf->has_ansi = 0;
 }
 
-/*
- * All load_* functions must call clear_buffer_lines(buf) at the top
- * before setting line_count = 0, otherwise old pointers leak / corrupt.
- *
- * The key fix: load_file was not freeing old lines on reload.
- */
 int load_file(Buffer *buf, const char *filepath) {
-    /* FREE OLD LINES FIRST */
     clear_buffer_lines(buf);
 
     if (is_pdf_file(filepath)) {
         int have_pdftotext = cmd_exists("pdftotext");
-        if (have_pdftotext) {
-            buf->scroll_offset = 0;
-            strncpy(buf->filepath, filepath, sizeof(buf->filepath) - 1);
-            buf->filepath[sizeof(buf->filepath) - 1] = '\0';
-            buf->lang = LANG_NONE;
-            buf->is_active = 1;
-            buf->is_http_buffer = 0;
-            buf->http_request[0] = '\0';
-            char *esc = shell_escape(filepath);
-            if (!esc) return -1;
-            char cmd[2048];
-            snprintf(cmd, sizeof(cmd), "pdftotext -layout %s - 2>/dev/null", esc);
-            free(esc);
-            FILE *p = popen(cmd, "r");
-            if (!p) return -1;
-            char line[MAX_LINE_LEN];
-            while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
-                size_t len = strlen(line);
-                while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
-                strip_overstrikes(line); strip_ansi(line); rtrim(line);
-                buf->lines[buf->line_count++] = safe_strdup(line);
-            }
-            pclose(p);
-            return (buf->line_count > 0) ? 0 : -1;
+        if (!have_pdftotext) return -1;
+
+        buf->scroll_offset = 0;
+        strncpy(buf->filepath, filepath, sizeof(buf->filepath) - 1);
+        buf->filepath[sizeof(buf->filepath) - 1] = '\0';
+        buf->lang = LANG_NONE;
+        buf->is_active = 1;
+        buf->is_http_buffer = 0;
+        buf->http_request[0] = '\0';
+        buf->has_ansi = 0;
+
+        char *esc = shell_escape(filepath);
+        if (!esc) return -1;
+
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd), "pdftotext -layout %s - 2>/dev/null", esc);
+        free(esc);
+
+        FILE *p = popen(cmd, "r");
+        if (!p) return -1;
+
+        char line[MAX_LINE_LEN];
+        while (fgets(line, sizeof(line), p) && buf->line_count < MAX_LINES) {
+            size_t len = strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+            rtrim(line);
+            store_line_pair(buf, line); // keeps raw/plain pairs (raw has no ansi here anyway)
         }
-        fprintf(stderr, "Warning: pdftotext not found.\n");
-        return -1;
+        pclose(p);
+        return (buf->line_count > 0) ? 0 : -1;
     }
 
-    FILE *f = fopen(filepath, "r");
-    if (!f) return -1;
     buf->scroll_offset = 0;
     strncpy(buf->filepath, filepath, sizeof(buf->filepath) - 1);
     buf->filepath[sizeof(buf->filepath) - 1] = '\0';
@@ -1463,16 +1700,26 @@ int load_file(Buffer *buf, const char *filepath) {
     buf->is_active = 1;
     buf->is_http_buffer = 0;
     buf->http_request[0] = '\0';
+
+    // Try external highlight first
+    if (load_via_highlight_file(buf, filepath) == 0) {
+        return 0;
+    }
+
+    // Fallback: plain file read
+    FILE *f = fopen(filepath, "r");
+    if (!f) return -1;
+    buf->has_ansi = 0;
+
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), f) && buf->line_count < MAX_LINES) {
         line[strcspn(line, "\n")] = 0;
-        strip_overstrikes(line); strip_ansi(line); rtrim(line);
-        buf->lines[buf->line_count++] = safe_strdup(line);
+        rtrim(line);
+        store_line_pair(buf, line);
     }
     fclose(f);
-    return 0;
+    return (buf->line_count > 0) ? 0 : -1;
 }
-
 /*
  * Fixed reload_http_buffer:
  *
@@ -1843,7 +2090,8 @@ void draw_buffer(ViewerState *state) {
             mvhline(y, 0, ' ', max_x);
             int text_width = max_x - line_nr_width - 1;
             if (text_width <= 0) text_width = max_x;
-            WrappedLine wl = wrap_line(buf->lines[logical_line], text_width);
+const char *src = buf->has_ansi ? buf->raw_lines[logical_line] : buf->lines[logical_line];
+WrappedLine wl = wrap_line(src, text_width);
             for (int seg = 0; seg < wl.count && y < content_start_y + content_height; seg++) {
                 if (state->show_line_numbers && seg == 0) {
                     attron(COLOR_PAIR(COLOR_LINENR));
@@ -1858,7 +2106,8 @@ void draw_buffer(ViewerState *state) {
                 int hi = (a > b) ? a : b;
                 int in_selection = state->copy_mode && logical_line >= lo && logical_line <= hi;
                 if (in_selection) attron(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
-                highlight_line(wl.segments[seg], buf->lang, y, line_nr_width + 1, max_x);
+if (buf->has_ansi) draw_ansi_line(y, line_nr_width + 1, wl.segments[seg], max_x);
+else              highlight_line(wl.segments[seg], buf->lang, y, line_nr_width + 1, max_x);
                 if (in_selection) attroff(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
                 y++;
             }
@@ -1891,7 +2140,7 @@ void draw_buffer(ViewerState *state) {
             int lo = (a < b) ? a : b;
             int hi = (a > b) ? a : b;
             int in_selection = state->copy_mode && line_idx >= lo && line_idx <= hi;
-            const char *line = buf->lines[line_idx];
+const char *line = buf->has_ansi ? buf->raw_lines[line_idx] : buf->lines[line_idx];
             int line_len = strlen(line);
             int start_col = state->horiz_scroll_offset;
             if (start_col >= line_len) continue;

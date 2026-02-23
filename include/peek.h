@@ -45,7 +45,8 @@ typedef enum {
 } Language;
 
 typedef struct {
-    char *lines[MAX_LINES];
+    char *lines[MAX_LINES];      // PLAIN text (ANSI stripped) used for search/copy
+    char *raw_lines[MAX_LINES];  // RAW text (may contain ANSI) used for display
     int line_count;
     char filepath[1024];
     char http_request[512];
@@ -53,6 +54,7 @@ typedef struct {
     int scroll_offset;
     int is_active;
     int is_http_buffer;
+    int has_ansi;                // display uses raw_lines if true
 } Buffer;
 
 typedef struct {
